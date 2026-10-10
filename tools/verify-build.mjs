@@ -56,7 +56,7 @@ if (missing.length === 0 && stale.length === 0) {
 
 // And name the files this work touched, with what they should contain.
 const CHECKS = [
-  ['browser-electron/desktop-bridge-host.js', /needsNewTab/, 'asks for a new tab from the second view'],
+  ['browser-electron/desktop-bridge-host.js', /op: 'ensureSidebar'/, 'materializes this conversation\'s own sidebar page'],
   ['browser-electron/settings-route.js', /Mozilla\\\/5/, 'admits the desktop panel by user-agent + accept-language'],
 ]
 console.log('')

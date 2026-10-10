@@ -10,8 +10,13 @@
 //
 //   node tools/mutation-check.mjs
 //
-// The edited file is restored in a finally block; a crash must not leave the bridge broken, and
-// the run exits non-zero if any mutant survives.
+// The edited file is restored in a finally block; a crash must not leave the bridge broken, and the
+// run exits non-zero if any mutant survives — OR IF A PATTERN NO LONGER MATCHES. Stale used to
+// print SKIP and the run still exited 0, which is the one shape that lets a gate confirm itself:
+// this file printed "every fix is covered" across two releases while four of seven fixes had moved
+// out from under their patterns. A pattern that no longer matches means the fix it guarded was
+// rewritten without anyone re-pointing the sabotage at the new shape, so the fix is UNVERIFIED
+// here and the run must say so.
 import { readFileSync, writeFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 
@@ -26,18 +31,14 @@ if (process.env.NODE_TEST_CONTEXT !== undefined) {
 
 const BRIDGE = 'desktop-bridge/plugin-browser-bridge.js'
 const HOST = 'src/browser-electron/desktop-bridge-host.ts'
+// The COMPILED host: behavioural tests import the build, so a sabotage that must change
+// behaviour has to land here. Mutations that target HOST are only visible to source-scanning
+// suites (session-invariants reads the .ts); pairing one with a behavioural test is a guaranteed
+// MISS, which is how this list quietly lost its retry coverage.
+const HOST_LIB = 'lib/browser-electron/desktop-bridge-host.js'
 
 /** Each fix, the revert that undoes it, and the test file that must notice. */
 const MUTATIONS = [
-  {
-    name: 'reuse ignores the owner ledger',
-    file: BRIDGE,
-    patch: (src) => src.replace(
-      /let reuseId = request\.newTab === true \? undefined : \[\.\.\.claims\.entries\(\)\]\s*\n\s*\.find\(\(\[guest, holder\]\) => holder === owner && guestById\(guest\) !== undefined\)\?\.\[0\]/,
-      'let reuseId = request.newTab === true ? undefined : [...claims.entries()][0]?.[0]',
-    ),
-    expect: 'bridge-ownership',
-  },
   {
     name: 'list returns every guest regardless of owner',
     file: BRIDGE,
@@ -59,29 +60,60 @@ const MUTATIONS = [
   {
     name: 'closeSidebarBrowser does not bound by owner',
     file: BRIDGE,
-    patch: (src) => src.replace(
-      /\.filter\(contents => claims\.get\(contents\.id\) === owner\)/,
-      '.filter(contents => true)',
-    ),
+    patch: (src) => src.replace(/\.filter\(contents => claims\.get\(contents\.id\) === owner\)/, '.filter(contents => true)'),
     expect: '',
   },
   {
-    name: 'the card click loses its once-per-call bound',
-    file: BRIDGE,
-    patch: (src) => src.replace(/const created = cardClicked \|\| addressBarAlready/, 'const created = false'),
-    expect: 'bridge-card-clicks',
-  },
-  {
-    name: 'guestFor stops asking for a new tab',
+    // The ledger left the bridge when the card-clicking path was deleted: the VIEW now carries the
+    // conversation it serves, so the sabotage is to read the owner from the process again — the
+    // exact mistake guestFor's comment describes.
+    name: 'guestFor reads its owner from the process, not the view',
     file: HOST,
-    patch: (src) => src.replace('const needsNewTab = this.views.size > 0', 'const needsNewTab = false'),
+    patch: (src) => src.replace('const owner = entry?.owner ?? this.owner', 'const owner = this.owner'),
     expect: 'session-invariants',
   },
   {
+    // The recovery that drops a dead guest before re-materializing it. Keeping the drop means the
+    // retry asks for the guest that just failed. Targets the BUILD: the behavioural suite imports
+    // lib/, so a src-only edit would be invisible to it. tsc splits the guard across two lines,
+    // so the statement itself is the anchor.
+    name: 'the guest-gone retry reuses the guest that died',
+    file: HOST_LIB,
+    patch: (src) => src.replace('delete lost.guest;', 'void 0;'),
+    expect: 'desktop-bridge-host',
+  },
+  {
+    // One page per conversation is the design; the per-view new-tab guard is gone BY DESIGN, so the
+    // invariant is its absence and the sabotage is to put the line back.
+    name: 'the per-view new-tab guard comes back',
+    file: HOST,
+    patch: (src) => src.replace('const entry = this.views.get(viewId)', 'const needsNewTab = this.views.size > 0\n    const entry = this.views.get(viewId)'),
+    expect: 'session-invariants',
+  },
+  {
+    // Same shape: the card-clicking path was deleted rather than bounded, so the invariant is its
+    // absence and the sabotage is to click the card again.
+    name: 'the bridge clicks the launcher card again',
+    file: BRIDGE,
+    patch: (src) => src.replace('function guestById(id) {', 'function guestById(id) {\n  card.click()'),
+    expect: 'session-invariants',
+  },
+  {
+    // A value taken out of a CDP reply must be read from the reply, not from its stringification.
     name: 'the reply-shape mistake returns',
     file: BRIDGE,
-    patch: (src) => src.replace('String((await sendCdp', 'String(await sendCdp'),
+    patch: (src) => src.replace('return sendCdp(shellId, method, params)', 'return String(await sendCdp(shellId, method, params))'),
     expect: 'bridge-reply-shape',
+  },
+  {
+    // The headless fix hands the per-child Xvfb to the Electron child as DISPLAY; the client
+    // keeps the display object only to tear it down with the child. Dropping the handoff
+    // revives the SIGTRAP crash the fix exists to end. Targets the BUILD: the spawn proof
+    // imports lib/, so a src-only edit would be invisible to it.
+    name: 'the virtual display is never handed to the child',
+    file: 'lib/browser-electron/remote-host.js',
+    patch: (src) => src.replace('env.DISPLAY = this.virtualDisplay.display;', 'void 0;'),
+    expect: 'headless-display',
   },
 ]
 
@@ -97,13 +129,15 @@ function passes (name) {
 }
 
 let uncovered = 0
+let stale = 0
 console.log('  revert each fix; the suite must notice')
 console.log('')
 for (const mutation of MUTATIONS) {
   const original = readFileSync(mutation.file, 'utf8')
   const patched = mutation.patch(original)
   if (patched === original) {
-    console.log('  SKIP   ' + mutation.name + '  (the pattern no longer matches — update this list)')
+    stale += 1
+    console.log('  STALE  ' + mutation.name + '  — the pattern no longer matches: the fix moved, so it is NOT re-verified here')
     continue
   }
   writeFileSync(mutation.file, patched)
@@ -119,7 +153,10 @@ for (const mutation of MUTATIONS) {
   }
 }
 console.log('')
-console.log(uncovered === 0
-  ? '  every fix is covered: reverting any one of them fails a test'
-  : '  ' + String(uncovered) + ' fix(es) are NOT covered by any test')
-process.exit(uncovered === 0 ? 0 : 1)
+if (uncovered === 0 && stale === 0) {
+  console.log('  every fix is covered: reverting any one of them fails a test')
+} else {
+  if (uncovered > 0) console.log('  ' + String(uncovered) + ' fix(es) are NOT covered by any test')
+  if (stale > 0) console.log('  ' + String(stale) + ' pattern(s) no longer match — update this list before trusting the gate')
+}
+process.exit(uncovered === 0 && stale === 0 ? 0 : 1)
