@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync, chmodSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, chmodSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
 
@@ -25,7 +25,7 @@ import { delimiter, join } from 'node:path'
 process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-headless-'))
 
 const { RemoteElectronViewHost, defaultHostMainPath } = await import('../lib/browser-electron/remote-host.js')
-const { needsVirtualDisplay, pickDisplayNumber, findXvfbBinary, takenDisplayNumbers } = await import('../lib/browser-electron/headless-display.js')
+const { needsVirtualDisplay, pickDisplayNumber, findXvfbBinary, takenDisplayNumbers, abstractDisplayNumbers, startVirtualDisplay } = await import('../lib/browser-electron/headless-display.js')
 
 test('the headless decision is exactly "Linux with no display at all"', () => {
   assert.equal(needsVirtualDisplay('linux', undefined, undefined), true)
@@ -57,6 +57,59 @@ test('Xvfb is found on PATH, PATH order first', () => {
     assert.match(onSystem, /Xvfb$/)
   }
 })
+
+/**
+ * The mount-namespace blindness, pinned.
+ *
+ * A sandboxed run (DSH's tool sandbox, a container) has a private /tmp: the
+ * host browser's Xvfb leaves no socket or lock file this namespace can see,
+ * so the picker used to hand out the host's own display and Xvfb died binding
+ * it. `/proc/net/unix` shows the abstract socket that namespace cannot hide.
+ * With the merge reverted, the behavioural test below FAILS (the picker takes
+ * the display the netns already serves); with it applied, both pass.
+ */
+test('abstract X sockets are read as taken displays', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-procnet-'))
+  const fixture = join(dir, 'unix')
+  writeFileSync(fixture, [
+    'Num       RefCount Protocol Flags    St Type Path',
+    '0000000000000000: 00000003 00000000 00000000 0001 03 569618 @/tmp/.X11-unix/X90',
+    '0000000000000000: 00000002 00000000 00010000 0001 01 569596 /tmp/.X11-unix/X90',
+    '0000000000000000: 00000003 00000000 00000000 0001 03 568789 @/tmp/.X11-unix/X95',
+    '0000000000000000: 00000003 00000000 00000000 0001 03 568790 @/tmp/.X11-unix/X192',
+    '0000000000000000: 00000002 00000000 00010000 0001 01 568791 /run/user/1000/wayland-0',
+    '0000000000000000: 00000003 00000000 00000000 0001 03 568792 @',
+  ].join('\n') + '\n', 'utf8')
+
+  assert.deepEqual(abstractDisplayNumbers(fixture), [90, 95, 192])
+  assert.deepEqual(abstractDisplayNumbers(join(dir, 'no-such-file')), [],
+    'an unreadable /proc is no display, never a crash')
+})
+
+test(
+  'a display only another namespace owns is never handed out',
+  { timeout: 60_000 },
+  async () => {
+    const xvfb = findXvfbBinary(process.env.PATH)
+    if (process.platform !== 'linux' || xvfb === undefined) return
+
+    // This namespace's own view is EMPTY: no socket, no lock. The only
+    // evidence that :90 is taken is the abstract socket in the fixture.
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-pick-'))
+    const socketDir = join(dir, 'X11-unix')
+    mkdirSync(socketDir, { recursive: true })
+    const fixture = join(dir, 'proc-net-unix')
+    writeFileSync(fixture, 'Num       RefCount Protocol Flags    St Type Path\n'
+      + '0000000000000000: 00000003 00000000 00000000 0001 03 569618 @/tmp/.X11-unix/X90\n', 'utf8')
+
+    const display = await startVirtualDisplay(socketDir, dir, fixture)
+    try {
+      assert.equal(display.display, ':91', 'the picker must skip a display the netns already serves')
+    } finally {
+      display.kill()
+    }
+  },
+)
 
 /**
  * The proof test: the real child, on this machine's real filesystem, with the

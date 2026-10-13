@@ -27,7 +27,7 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process'
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
 
@@ -119,6 +119,35 @@ export function pickDisplayNumber(taken: readonly number[], min = MIN_DISPLAY_NU
 }
 
 /**
+ * Display numbers another mount namespace already owns.
+ *
+ * `takenDisplayNumbers` above reads THIS namespace's /tmp. A container — or
+ * the DSH tool sandbox, which hands every process a private /tmp — cannot see
+ * the host browser's sockets and lock files, so the picker would hand out a
+ * display the host is already serving and Xvfb would die binding it. Every X
+ * server also listens on an ABSTRACT socket, `@/tmp/.X11-unix/X<n>`, which
+ * lives in the network namespace instead, and `/proc/net/unix` lists them all
+ * regardless of mount namespace. Reading it makes the collision visible.
+ *
+ * Pure over its input, like its sibling above: an unreadable /proc yields no
+ * numbers and never an error, so a platform without that file keeps the
+ * previous behaviour exactly.
+ */
+export function abstractDisplayNumbers(procNetUnix = '/proc/net/unix'): number[] {
+  let text: string
+  try {
+    text = readFileSync(procNetUnix, 'utf8')
+  } catch {
+    return []
+  }
+  const taken = new Set<number>()
+  for (const match of text.matchAll(/\/tmp\/\.X11-unix\/X(\d+)/g)) {
+    taken.add(Number(match[1]))
+  }
+  return [...taken].sort((a, b) => a - b)
+}
+
+/**
  * Start Xvfb on a free display number and wait until its socket exists.
  *
  * Rejects — rather than falling back to a displayless spawn — when Xvfb is
@@ -126,7 +155,11 @@ export function pickDisplayNumber(taken: readonly number[], min = MIN_DISPLAY_NU
  * the same SIGTRAP this exists to prevent, and a silent fallback would hide a
  * diagnosable environment problem behind a crash loop.
  */
-export async function startVirtualDisplay(): Promise<VirtualDisplay> {
+export async function startVirtualDisplay(
+  socketDir = join(tmpdir(), '.X11-unix'),
+  lockDir = tmpdir(),
+  procNetUnix = '/proc/net/unix',
+): Promise<VirtualDisplay> {
   const binary = findXvfbBinary(process.env.PATH)
   if (binary === undefined) {
     throw new Error(
@@ -134,7 +167,14 @@ export async function startVirtualDisplay(): Promise<VirtualDisplay> {
       + ' Fedora: `dnf install xorg-server-xvfb`) or set DISPLAY to a running X server',
     )
   }
-  const number = pickDisplayNumber(takenDisplayNumbers(join(tmpdir(), '.X11-unix'), tmpdir()))
+  // Two views of "taken": the files this namespace can see, and the abstract
+  // sockets every namespace shares. Using only the first is how the picker
+  // once handed out the host browser's own display.
+  const taken = [
+    ...takenDisplayNumbers(socketDir, lockDir),
+    ...abstractDisplayNumbers(procNetUnix),
+  ]
+  const number = pickDisplayNumber(taken)
   if (number === undefined) {
     throw new Error(
       `no free X display number in ${String(MIN_DISPLAY_NUMBER)}..${String(MAX_DISPLAY_NUMBER)}`,

@@ -57,6 +57,22 @@ export declare function takenDisplayNumbers(socketDir: string, lockDir: string):
  */
 export declare function pickDisplayNumber(taken: readonly number[], min?: number, max?: number): number | undefined;
 /**
+ * Display numbers another mount namespace already owns.
+ *
+ * `takenDisplayNumbers` above reads THIS namespace's /tmp. A container — or
+ * the DSH tool sandbox, which hands every process a private /tmp — cannot see
+ * the host browser's sockets and lock files, so the picker would hand out a
+ * display the host is already serving and Xvfb would die binding it. Every X
+ * server also listens on an ABSTRACT socket, `@/tmp/.X11-unix/X<n>`, which
+ * lives in the network namespace instead, and `/proc/net/unix` lists them all
+ * regardless of mount namespace. Reading it makes the collision visible.
+ *
+ * Pure over its input, like its sibling above: an unreadable /proc yields no
+ * numbers and never an error, so a platform without that file keeps the
+ * previous behaviour exactly.
+ */
+export declare function abstractDisplayNumbers(procNetUnix?: string): number[];
+/**
  * Start Xvfb on a free display number and wait until its socket exists.
  *
  * Rejects — rather than falling back to a displayless spawn — when Xvfb is
@@ -64,4 +80,4 @@ export declare function pickDisplayNumber(taken: readonly number[], min?: number
  * the same SIGTRAP this exists to prevent, and a silent fallback would hide a
  * diagnosable environment problem behind a crash loop.
  */
-export declare function startVirtualDisplay(): Promise<VirtualDisplay>;
+export declare function startVirtualDisplay(socketDir?: string, lockDir?: string, procNetUnix?: string): Promise<VirtualDisplay>;

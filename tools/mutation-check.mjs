@@ -115,6 +115,20 @@ const MUTATIONS = [
     patch: (src) => src.replace('env.DISPLAY = this.virtualDisplay.display;', 'void 0;'),
     expect: 'headless-display',
   },
+  {
+    // The picker went blind to displays another mount namespace owns: the host browser's Xvfb
+    // is invisible through a private /tmp, so the picker handed out the host's own display and
+    // Xvfb died binding it — five suite failures with nothing wrong in the code. The fix reads
+    // the abstract sockets every namespace shares. Targets the BUILD: the proof imports lib/,
+    // and the choice lives in startVirtualDisplay.
+    name: 'the picker cannot see a display another namespace owns',
+    file: 'lib/browser-electron/headless-display.js',
+    patch: (src) => src.replace(
+      /const taken = \[\s*\.\.\.takenDisplayNumbers\(socketDir, lockDir\),\s*\.\.\.abstractDisplayNumbers\(procNetUnix\),\s*\];/,
+      'const taken = takenDisplayNumbers(socketDir, lockDir);',
+    ),
+    expect: 'headless-display',
+  },
 ]
 
 /** @returns whether the named test file still passes. */
