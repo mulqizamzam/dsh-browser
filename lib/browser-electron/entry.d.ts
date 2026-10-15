@@ -36,6 +36,15 @@ export interface Config {
     readonly snapshotMaxElements?: number;
     /** Maximum content characters before truncation when no maxChars is given. No longer read: the cap is per format (html and json 50 000, otherwise 20 000). */
     readonly contentMaxChars?: number;
+    /**
+     * Attach to a browser that is already running, at this CDP endpoint, instead of
+     * launching one. Either its `ws://host:port/devtools/browser/<id>` URL, or an
+     * `http://host:port` origin whose `/json/version` publishes that URL. When set,
+     * nothing is spawned, no profile directory is used, and the browser is never
+     * killed — it is the operator's, not ours. Unset falls back to
+     * `DSH_BROWSER_CDP_ENDPOINT`; if neither is set the carrier launches as before.
+     */
+    readonly cdpEndpoint?: string;
 }
 export declare const Config: z<Config>;
 /** Register the Electron browser provider with `ctx.browser`. */

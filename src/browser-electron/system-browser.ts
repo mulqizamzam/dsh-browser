@@ -18,6 +18,16 @@
  * session for it, and the plugin's commands ride that session. Node 22 ships a global
  * `WebSocket`, so this needs no dependency at all.
  *
+ * ATTACHING
+ * A deployment can also point this carrier at a browser that is ALREADY running, by setting
+ * `cdpEndpoint` (or `DSH_BROWSER_CDP_ENDPOINT`) to that browser's
+ * `ws://host:port/devtools/browser/<id>` URL, or to the `http://host:port` origin whose
+ * `/json/version` publishes it. Nothing is spawned then, no profile directory is claimed,
+ * created or removed, and the browser is NOT killed when the session ends — it was never ours;
+ * the operator started it, quite possibly with their own windows in it. An endpoint that cannot
+ * be reached says so, by name, and starts nothing: falling back to a launch would hand the
+ * operator a different browser than the one they asked for.
+ *
  * WHAT IT IMPLEMENTS
  * The same `ElectronBrowserViewHost` seam as the self-hosted and sidebar hosts, so
  * the provider, the tools, history, the cursor and teardown rules are unchanged —
@@ -72,6 +82,7 @@ const defaultLauncher: BrowserLauncher = (path, args) =>
   spawn(path, [...args], { stdio: ['ignore', 'ignore', 'ignore'], windowsHide: false })
 import { spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { BrowserError } from '../browser/types.js'
 import type { ElectronBrowserViewHost, ElectronViewHandle } from './provider.js'
 
 /** Which browser the user asked for. */
@@ -267,6 +278,135 @@ export function searchSummary(
   return [...onPath, ...located]
 }
 
+/**
+ * Ceiling on one attempt to resolve an operator-set CDP endpoint.
+ *
+ * Unlike the launch loop's probe this happens once per connection rather than inside a poll, so
+ * it can afford to wait for a slow answer — but not to hang: an address that swallows packets
+ * has to fail while the operator is still looking at the call that triggered it.
+ */
+const ENDPOINT_PROBE_MS = 10_000
+
+/**
+ * The part of `fetch` the endpoint probe uses.
+ *
+ * Narrower than `fetch` on purpose: a caller may inject a stub that only has to answer with a
+ * JSON body, which is how the endpoint rules are exercised with no browser anywhere.
+ */
+export type EndpointFetch = (url: string, init: { signal: AbortSignal }) => Promise<{ json(): Promise<unknown> }>
+
+/**
+ * A browser that is already running, named by the operator.
+ *
+ * The counterpart of {@link DetectedBrowser}: that one is an installation to start, this one is
+ * a process to join.
+ */
+export interface CdpAttach {
+  /**
+   * The browser's CDP endpoint: its own `webSocketDebuggerUrl`
+   * (`ws://host:port/devtools/browser/<id>`), or an `http(s)://host:port` origin, which is
+   * resolved through `/json/version`.
+   */
+  readonly endpoint: string
+  /** How to probe an http origin. Injected for tests; the global `fetch` otherwise. */
+  readonly fetch?: EndpointFetch
+}
+
+/**
+ * What a host drives: an installation to launch, or a running browser to attach to.
+ *
+ * The two are exclusive in the type rather than in a flag beside it, so "attaching spawns
+ * nothing and claims no profile" is a property of what the object holds instead of a promise
+ * about how it behaves.
+ */
+export type BrowserTarget = DetectedBrowser | CdpAttach
+
+/** Whether a target names a browser to attach to, rather than one to launch. */
+function isAttach(target: BrowserTarget): target is CdpAttach {
+  return 'endpoint' in target
+}
+
+/**
+ * The operator's CDP endpoint: the config field when it is set, otherwise
+ * `DSH_BROWSER_CDP_ENDPOINT`.
+ *
+ * A blank value counts as absent on both sides. An empty config field outranking a real
+ * environment variable would make the variable look broken, and a variable set to "" — which is
+ * what `DSH_BROWSER_CDP_ENDPOINT=` leaves in the environment — must not read as an endpoint.
+ * @param configured - the `cdpEndpoint` config field.
+ * @param env - the environment to fall back to.
+ * @returns the endpoint, or undefined when neither side sets one.
+ */
+export function cdpEndpointFrom(configured?: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  for (const candidate of [configured, env.DSH_BROWSER_CDP_ENDPOINT]) {
+    if (candidate !== undefined && candidate.trim() !== '') return candidate.trim()
+  }
+  return undefined
+}
+
+/**
+ * The WebSocket URL to speak CDP on, from an operator-set endpoint.
+ *
+ * A `ws://`/`wss://` URL already IS that URL. An `http://`/`https://` origin is the browser's
+ * debugging port, and `/json/version` is where it publishes the URL to use instead. Anything
+ * else is refused rather than guessed at: every guess picks a browser the operator did not name,
+ * and naming one is the entire point of this setting.
+ * @param endpoint - the configured endpoint.
+ * @param fetchImpl - how to ask an http origin; injected for tests.
+ * @returns the `webSocketDebuggerUrl` to connect to.
+ */
+export async function cdpEndpointUrl(endpoint: string, fetchImpl: EndpointFetch = fetch): Promise<string> {
+  let parsed: URL
+  try {
+    parsed = new URL(endpoint.trim())
+  } catch {
+    throw cdpUnreachable(endpoint, 'it is not a URL')
+  }
+  if (parsed.protocol === 'ws:' || parsed.protocol === 'wss:') return endpoint.trim()
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw cdpUnreachable(endpoint, `its scheme (${parsed.protocol}) is neither ws:// nor http://`)
+  }
+  // A path on the origin is not part of the debugging protocol: /json/version hangs off the root.
+  const versionUrl = new URL('/json/version', parsed).toString()
+  let version: { webSocketDebuggerUrl?: unknown }
+  try {
+    version = await (await fetchImpl(versionUrl, { signal: AbortSignal.timeout(ENDPOINT_PROBE_MS) })).json() as { webSocketDebuggerUrl?: unknown }
+  } catch (error) {
+    throw cdpUnreachable(endpoint, `${versionUrl} did not answer: ${describeError(error)}`, error)
+  }
+  const socket = version?.webSocketDebuggerUrl
+  if (typeof socket !== 'string' || socket === '') {
+    throw cdpUnreachable(endpoint, `${versionUrl} reported no webSocketDebuggerUrl`)
+  }
+  return socket
+}
+
+/**
+ * The one failure this mode has, named so a caller can act on it.
+ *
+ * Deliberately no second code for a typo and a dead address: both mean "nothing is reachable at
+ * the endpoint you set", and the message says which one it looked like. The endpoint is always
+ * in the message, because the value is configuration — its reader cannot see it from here.
+ * @param endpoint - the endpoint that was tried.
+ * @param why - what was wrong with it.
+ * @param cause - the underlying failure, when there was one.
+ * @returns the error to throw.
+ */
+function cdpUnreachable(endpoint: string, why: string, cause?: unknown): BrowserError {
+  return new BrowserError(
+    `browser: the CDP endpoint "${endpoint}" is unusable — ${why}. Nothing was launched: this `
+    + 'deployment attaches to the browser it names (config cdpEndpoint / DSH_BROWSER_CDP_ENDPOINT), '
+    + 'and falling back to a launch would drive a different browser than the one it asked for.',
+    'BROWSER_CDP_ENDPOINT_UNREACHABLE',
+    { cause },
+  )
+}
+
+/** One error as a line of text, for a message that has to stay readable. */
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
 /** One CDP connection to a browser-level WebSocket, with flattened sessions. */
 class CdpClient {
   private nextId = 1
@@ -427,8 +567,10 @@ export class SystemBrowserViewHost implements ElectronBrowserViewHost {
   private readonly stubborn: { kill: () => void; exitCode: number | null; signalCode: NodeJS.Signals | null }[] = []
 
   /**
-   * @param browser - the detected installation to launch on first use.
+   * @param browser - the detected installation to launch on first use, or the endpoint of a
+   *   browser that is already running — which is then never launched, profiled or killed.
    * @param profileDir - a plugin-owned directory; the user's own profile is never touched.
+   *   Unused in attach mode, which resolves no profile at all.
    * @param extraArgs - additional Chromium switches.
    * @param ephemeralDir - a directory to delete on release, when the user has turned
    *   persistence off so no login state outlives the session.
@@ -441,19 +583,50 @@ export class SystemBrowserViewHost implements ElectronBrowserViewHost {
    *   provide something that actually speaks CDP, so the state those tests describe exists.
    */
   constructor(
-    private readonly browser: DetectedBrowser,
-    private readonly profileDir: string,
+    private readonly browser: BrowserTarget,
+    private readonly profileDir: string = '',
     private readonly extraArgs: readonly string[] = [],
     private readonly ephemeralDir?: string,
     private readonly launcher: BrowserLauncher = defaultLauncher,
-  ) {}
-
-  /** Which product this host would drive (for diagnostics). */
-  get kind(): DetectedBrowser['kind'] {
-    return this.browser.kind
+  ) {
+    this.ownsBrowser = !isAttach(browser)
   }
 
-  /** Whether the browser has actually been started yet (diagnostics and tests). */
+  /**
+   * Whether this host owns the browser process it drives, and may therefore kill it.
+   *
+   * Attach mode is why this is a field and not a comment. The operator pointed us at a browser we
+   * did not start — very possibly the one they are working in — so releasing this host closes our
+   * connection to it and nothing else. Every path that ends a browser's life reads this flag
+   * instead of re-deriving the answer, so the answer cannot drift away from the mode that set it.
+   */
+  readonly ownsBrowser: boolean
+
+  /**
+   * Build a host that ATTACHES to a browser already running at `endpoint`.
+   *
+   * The only way in: attach mode has no installation, no profile, no switches and no ephemeral
+   * directory, so spelling it out as a constructor call would be a row of placeholders with one
+   * real value among them — and a placeholder that later moves is how a launch sneaks back in.
+   * @param endpoint - a `ws://` browser URL, or an `http://host:port` origin to resolve.
+   * @param launcher - never called in this mode; injectable so a test can prove it stays uncalled.
+   * @param fetchImpl - how to probe an http origin; injectable for the same reason.
+   * @returns the host.
+   */
+  static attach(endpoint: string, launcher: BrowserLauncher = defaultLauncher, fetchImpl?: EndpointFetch): SystemBrowserViewHost {
+    return new SystemBrowserViewHost({ endpoint, fetch: fetchImpl }, '', [], undefined, launcher)
+  }
+
+  /** Which product this host would drive (for diagnostics); undefined when it attaches. */
+  get kind(): DetectedBrowser['kind'] | undefined {
+    return isAttach(this.browser) ? undefined : this.browser.kind
+  }
+
+  /**
+   * Whether the browser has actually been started yet (diagnostics and tests).
+   *
+   * Always false for a host that attaches: it starts nothing, it joins something.
+   */
   get started(): boolean {
     return this.child !== undefined
   }
@@ -534,8 +707,39 @@ export class SystemBrowserViewHost implements ElectronBrowserViewHost {
       this.forgetBrowserState()
     }
     // Concurrent first calls share one startup rather than racing two browsers.
-    this.starting ??= this.start().finally(() => { this.starting = undefined })
+    const attach = isAttach(this.browser) ? this.browser : undefined
+    this.starting ??= (attach === undefined ? this.start() : this.attachTo(attach)).finally(() => { this.starting = undefined })
     return await this.starting
+  }
+
+  /**
+   * Connect to the browser the operator named, instead of launching one.
+   *
+   * The endpoint is resolved on every (re)connect rather than remembered: a browser restarted
+   * under the same address is picked up, and one that is gone fails HERE, naming the endpoint —
+   * never by quietly launching a different browser to replace it.
+   * @param attach - the browser to reach.
+   * @returns the connected client.
+   */
+  private async attachTo(attach: CdpAttach): Promise<CdpClient> {
+    const url = await cdpEndpointUrl(attach.endpoint, attach.fetch)
+    const client = new CdpClient(url)
+    try {
+      // Bounded by `whenReady` itself, and reached only after the address answered (an http
+      // origin) or was taken as given (a ws:// URL) — so this is a handshake, not a search.
+      await client.whenReady()
+    } catch (error) {
+      client.close()
+      throw cdpUnreachable(attach.endpoint, `${url} did not complete the CDP handshake (${describeError(error)})`, error)
+    }
+    // Released while the handshake was in flight. The connection is dropped because it is ours;
+    // the browser is left alone because it is not.
+    if (this.disposed) {
+      client.close()
+      throw new Error('dsh-builtin-browser: this browser host was released')
+    }
+    this.client = client
+    return client
   }
 
   /**
@@ -547,6 +751,13 @@ export class SystemBrowserViewHost implements ElectronBrowserViewHost {
    * @returns the connected client.
    */
   private async start(): Promise<CdpClient> {
+    const browser = this.browser
+    if (isAttach(browser)) {
+      // Unreachable: ensureClient() only calls this for a launch target. Loud rather than silent,
+      // because the alternative to throwing here is spawning a browser for a deployment that
+      // asked to attach to one — the exact substitution this mode exists to prevent.
+      throw new Error('dsh-builtin-browser: this host attaches to an existing browser; there is nothing to launch')
+    }
     const args = [
       '--remote-debugging-port=0',
       `--user-data-dir=${this.profileDir}`,
@@ -607,12 +818,12 @@ export class SystemBrowserViewHost implements ElectronBrowserViewHost {
     const spawnedAt = Date.now()
     let child: ReturnType<typeof spawn>
     try {
-      child = this.launcher(this.browser.path, args)
+      child = this.launcher(browser.path, args)
     } catch (error) {
       // spawn throws synchronously for some targets (a .cmd on Windows, a path that cannot
       // be executed). Without this the exception escaped start() and skipped every
       // diagnostic below it.
-      throw new Error(`dsh-builtin-browser: could not launch ${this.browser.path}: ${error instanceof Error ? error.message : String(error)}`)
+      throw new Error(`dsh-builtin-browser: could not launch ${browser.path}: ${error instanceof Error ? error.message : String(error)}`)
     }
     this.child = child
     /**
@@ -711,7 +922,7 @@ export class SystemBrowserViewHost implements ElectronBrowserViewHost {
     // Each ending gets its own message. The old single message blamed a CDP timeout for
     // all of them, which sent the reader looking for a port problem when the browser had
     // simply failed to launch.
-    const target = `${this.browser.kind} (${this.browser.path})`
+    const target = `${browser.kind} (${browser.path})`
     if (stopped === 'launch-failed') {
       throw new Error(`dsh-builtin-browser: could not launch ${target}: ${launchError?.message ?? 'unknown error'}`)
     }
@@ -888,17 +1099,31 @@ export class SystemBrowserViewHost implements ElectronBrowserViewHost {
    * The user's own windows belong to a different process and are never touched. A
    * host whose browser was never started (the common case when nobody used the
    * browser) simply tears down its bookkeeping.
+   *
+   * A host that ATTACHED never launched anything, so release stops at closing its own
+   * connection: the browser it was driving outlives this plugin, which is the whole point of
+   * pointing it at one that already existed. `ownsBrowser` is what decides that — not whether a
+   * child happens to be recorded, which is a fact about the launch path rather than about who
+   * the process belongs to.
+   *
+   * (The gate is not observable from the attach side, and the tests say so: an attached host
+   * never records a child, so removing the check altogether changes nothing a test can see —
+   * verified by mutation, which is why this is written as an invariant of the mode rather than
+   * as a case it proves. What the tests do decide is both directions of the flag itself: true
+   * kills the browser this host started, false leaves the one it did not start alone.)
    */
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
     this.forgetBrowserState()
     this.client?.close()
-    try { this.child?.kill() } catch { /* already gone */ }
-    // And anything that ignored an earlier kill. They hold this profile, so leaving them
-    // running means the next launch contends with a browser nobody owns.
-    for (const leftover of this.stubborn.splice(0)) {
-      try { leftover.kill() } catch { /* already gone */ }
+    if (this.ownsBrowser) {
+      try { this.child?.kill() } catch { /* already gone */ }
+      // And anything that ignored an earlier kill. They hold this profile, so leaving them
+      // running means the next launch contends with a browser nobody owns.
+      for (const leftover of this.stubborn.splice(0)) {
+        try { leftover.kill() } catch { /* already gone */ }
+      }
     }
     const ephemeral = this.ephemeralDir
     if (ephemeral !== undefined && this.child !== undefined) {

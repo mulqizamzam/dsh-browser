@@ -4,6 +4,12 @@ import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+// These tests spawn plain-Node children and need no display. Without this pin a headless
+// system starts an Xvfb per spawn, and headless-display.test.mjs — which asserts machine-wide
+// that a failed spawn leaks no virtual display — counts those displays as leaks when the test
+// files run in parallel. The display pool is global, so the files that do not need it keep out.
+process.env.DISPLAY = process.env.DISPLAY ?? ':77'
+
 /**
  * The Electron-binary probe used to be cached for the whole host lifetime —
  * including a NEGATIVE result. Since provider selection also happens once per

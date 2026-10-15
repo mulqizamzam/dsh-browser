@@ -597,6 +597,49 @@ export interface BrowserProvider {
     replay(session: BrowserSessionId, seq: number): Promise<void>;
     /** Close the session and destroy its backing surface. Idempotent. */
     close(session: BrowserSessionId): Promise<void>;
+    /**
+     * Print the active tab to a PDF file. A plain request/response CDP call: no events, no
+     * state carried between calls, and the destination goes through the same admission gate as
+     * a download (absolute, inside downloadDir, never overwriting).
+     * @param session - the session whose active tab to print.
+     * @param request - page setup and the destination path.
+     * @param signal - cancellation.
+     * @returns the written path and its size in bytes.
+     */
+    pdf(session: BrowserSessionId, request: BrowserPdfRequest, signal?: AbortSignal): Promise<BrowserPdfResult>;
+    /**
+     * Start or stop a Chrome trace of the active tab. `start` needs no destination; `stop`
+     * writes the trace through the same admission gate as a download.
+     * @param session - the session whose active tab to trace.
+     * @param request - `start` or `stop`, plus the destination for `stop`.
+     * @param signal - cancellation.
+     * @returns whether tracing is active, and for a stop the written path and size.
+     */
+    trace(session: BrowserSessionId, request: BrowserTraceRequest, signal?: AbortSignal): Promise<BrowserTraceResult>;
+    /**
+     * Start or stop a screen recording of the active tab, encoded with ffmpeg.
+     * @param session - the session whose active tab to record.
+     * @param request - `start` or `stop`, plus encoding options and the destination.
+     * @param signal - cancellation.
+     * @returns whether a recording is active, and for a stop the written file and frame count.
+     */
+    video(session: BrowserSessionId, request: BrowserVideoRequest, signal?: AbortSignal): Promise<BrowserVideoResult>;
+    /**
+     * Record, read, or clear the network log of the active tab.
+     * @param session - the session whose active tab to inspect.
+     * @param request - the action plus its filters.
+     * @param signal - cancellation.
+     * @returns recording state, matching entries, and any requested response body.
+     */
+    network(session: BrowserSessionId, request: BrowserNetworkRequest, signal?: AbortSignal): Promise<BrowserNetworkResult>;
+    /**
+     * Report the browser carriers this installation can use, and optionally install one. Not
+     * session-scoped: it answers for the machine, and needs no browser to be running.
+     * @param request - `status` or `install`.
+     * @param signal - cancellation.
+     * @returns carriers, readiness, and operator-facing notes.
+     */
+    install(request: BrowserInstallRequest, signal?: AbortSignal): Promise<BrowserInstallResult>;
 }
 /**
  * One visited page in the persistent browsing history — the durable record that
@@ -630,6 +673,199 @@ export interface BrowserHistoryEntry {
     readonly error?: string;
     /** Epoch millis of the operation. */
     readonly at: number;
+}
+/** How the agent asked to print a page to PDF. */
+export interface BrowserPdfRequest {
+    /** Absolute path to write. Same admission gate as a download; an existing file is never replaced. */
+    readonly savePath: string;
+    /** Landscape orientation (default false). */
+    readonly landscape?: boolean;
+    /** Print backgrounds (default true — a designed page usually needs them). */
+    readonly printBackground?: boolean;
+    /** Paper width in inches (default 8.5). */
+    readonly paperWidth?: number;
+    /** Paper height in inches (default 11). */
+    readonly paperHeight?: number;
+    /** Top margin in inches (default 0.4). */
+    readonly marginTop?: number;
+    /** Bottom margin in inches (default 0.4). */
+    readonly marginBottom?: number;
+    /** Left margin in inches (default 0.4). */
+    readonly marginLeft?: number;
+    /** Right margin in inches (default 0.4). */
+    readonly marginRight?: number;
+    /** Rendering scale, 0.1–2 (default 1). */
+    readonly scale?: number;
+    /** Paper ranges to print, e.g. `1-5, 8, 11-13`. */
+    readonly pageRanges?: string;
+    /** Honour the page's own @page size instead of the paper options. */
+    readonly preferCSSPageSize?: boolean;
+}
+/** What a completed PDF print produced. */
+export interface BrowserPdfResult {
+    /** The file that was written. */
+    readonly path: string;
+    /** Its size in bytes. */
+    readonly bytes: number;
+}
+/** Whether a trace call starts or ends a recording. */
+export type BrowserTraceAction = 'start' | 'stop';
+/** What the agent asked of the tracer. */
+export interface BrowserTraceRequest {
+    /** `start` begins a trace; `stop` ends it and writes the file. */
+    readonly action: BrowserTraceAction;
+    /** Absolute path for the trace JSON. Required on `stop`, ignored on `start`. */
+    readonly savePath?: string;
+    /** CDP trace categories; the timeline set is used when omitted. */
+    readonly categories?: readonly string[];
+}
+/** The tracer's answer. */
+export interface BrowserTraceResult {
+    /** Whether a trace is now being recorded. */
+    readonly tracing: boolean;
+    /** The written trace file, on a stop that wrote one. */
+    readonly path?: string;
+    /** Its size in bytes. */
+    readonly bytes?: number;
+    /** True when the size cap cut the trace short. */
+    readonly truncated?: boolean;
+}
+/** Whether a video call starts or ends a recording. */
+export type BrowserVideoAction = 'start' | 'stop';
+/** What the agent asked of the recorder. */
+export interface BrowserVideoRequest {
+    /** `start` begins recording; `stop` ends it and encodes the file. */
+    readonly action: BrowserVideoAction;
+    /** Absolute path for the video. Required on `stop`, ignored on `start`. */
+    readonly savePath?: string;
+    /** Screencast frame quality, 1–100 (default 70). */
+    readonly quality?: number;
+    /** Downscale frames to this width before encoding. */
+    readonly maxWidth?: number;
+    /** Downscale frames to this height before encoding. */
+    readonly maxHeight?: number;
+    /** Encoder output frames per second (default 10). */
+    readonly fps?: number;
+    /** Cap on buffered frames (default 600); beyond it frames are dropped and counted. */
+    readonly maxFrames?: number;
+}
+/** The recorder's answer. */
+export interface BrowserVideoResult {
+    /** Whether a recording is now in progress. */
+    readonly recording: boolean;
+    /** The written video file, on a stop that wrote one. */
+    readonly path?: string;
+    /** Its size in bytes. */
+    readonly bytes?: number;
+    /** Frames encoded. */
+    readonly frames?: number;
+    /** Frames discarded because a cap was reached. */
+    readonly droppedFrames?: number;
+    /** Wall-clock length of the recording in milliseconds. */
+    readonly durationMs?: number;
+}
+/** What the agent asked of the network inspector. */
+export type BrowserNetworkAction = 'start' | 'stop' | 'list' | 'body' | 'clear';
+/** One request/response pair the inspector retained. */
+export interface BrowserNetworkEntry {
+    /** CDP request id, used to ask for the body. */
+    readonly requestId: string;
+    /** Request URL. */
+    readonly url: string;
+    /** HTTP method. */
+    readonly method: string;
+    /** CDP resource type (Document, XHR, Script, …) when it was reported. */
+    readonly resourceType?: string;
+    /** Response status, once one arrived. */
+    readonly status?: number;
+    /** Response status text. */
+    readonly statusText?: string;
+    /** Response mime type. */
+    readonly mimeType?: string;
+    /** Encoded body size in bytes, as CDP reported it. */
+    readonly encodedBytes?: number;
+    /** Whether the response came from the cache. */
+    readonly fromCache?: boolean;
+    /** Failure text, when the request failed instead of answering. */
+    readonly failed?: string;
+    /** Epoch milliseconds when the request was sent, measured on the browser's clock. */
+    readonly startedAtMs?: number;
+    /** Milliseconds from request to finished/failed. */
+    readonly durationMs?: number;
+}
+/** What the agent asked of the network inspector. */
+export interface BrowserNetworkRequest {
+    /** Which operation to run. */
+    readonly action: BrowserNetworkAction;
+    /** URL filter: a substring, or a `/regex/` literal. */
+    readonly urlPattern?: string;
+    /** Keep only this CDP resource type. */
+    readonly resourceType?: string;
+    /** Keep only this HTTP method (case-insensitive). */
+    readonly method?: string;
+    /** Keep only this exact response status. */
+    readonly status?: number;
+    /** Keep only failed requests. */
+    readonly onlyFailed?: boolean;
+    /** Maximum entries to return (default 50, max 200). */
+    readonly limit?: number;
+    /** Which request's body to fetch, for `action: 'body'`. */
+    readonly requestId?: string;
+}
+/** The network inspector's answer. */
+export interface BrowserNetworkResult {
+    /** Whether events are currently being recorded. */
+    readonly recording: boolean;
+    /** The matching entries, newest first. */
+    readonly entries: readonly BrowserNetworkEntry[];
+    /** How many entries the buffer holds in total, before filtering. */
+    readonly total: number;
+    /** How many entries were evicted because the buffer cap was reached. */
+    readonly dropped: number;
+    /** The response body, for `action: 'body'`. */
+    readonly body?: string;
+    /** Whether {@link BrowserNetworkResult.body} is base64-encoded. */
+    readonly base64?: boolean;
+    /** Whether the body was cut at the size cap. */
+    readonly truncated?: boolean;
+}
+/** Whether an install call only reports, or actually installs. */
+export type BrowserInstallAction = 'status' | 'install';
+/** One browser this installation could drive. */
+export interface BrowserInstallCarrier {
+    /** Which carrier this is. */
+    readonly kind: 'electron' | 'chrome' | 'edge';
+    /** The executable it resolved to, when one was found. */
+    readonly path?: string;
+    /** How it was found: an explicit override, PATH, or a conventional location. */
+    readonly source?: string;
+    /** Version string, when it could be read without launching the browser. */
+    readonly version?: string;
+    /** Whether the executable is actually there. */
+    readonly exists: boolean;
+}
+/** What the agent asked of the installer. */
+export interface BrowserInstallRequest {
+    /** `status` (default) reports; `install` downloads. */
+    readonly action?: BrowserInstallAction;
+    /** What to install: the bundled Electron runtime, or a system browser. Default `electron`. */
+    readonly target?: 'electron' | 'system';
+}
+/** The installer's answer. */
+export interface BrowserInstallResult {
+    /** Every carrier that was looked for. */
+    readonly carriers: readonly BrowserInstallCarrier[];
+    /** The carrier channel the settings currently select. */
+    readonly channel: string;
+    /** Whether the selected channel has a usable carrier right now. */
+    readonly ready: boolean;
+    /** What the operator has to know: what is missing, and the exact command that fixes it. */
+    readonly notes: readonly string[];
+    /** What an `install` action actually installed. */
+    readonly installed?: {
+        readonly kind: string;
+        readonly version?: string;
+    };
 }
 /**
  * Typed browser error with a machine-routable, open-string `code` and chained

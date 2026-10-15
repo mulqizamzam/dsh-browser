@@ -8,7 +8,7 @@
  */
 import { Context, Service } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
-import type { BrowserA11yRequest, BrowserA11yResult, BrowserCheckRequest, BrowserClearRequest, BrowserClickRequest, BrowserContentRequest, BrowserContentResult, BrowserDownloadRequest, BrowserElementTarget, BrowserExecuteRequest, BrowserExecuteResult, BrowserFillRequest, BrowserFillResult, BrowserGetValueRequest, BrowserGetValueResult, BrowserHistoryEntry, BrowserNavigateRequest, BrowserOpenRequest, BrowserProvider, BrowserScrapeRequest, BrowserScrapeResult, BrowserScreenshotRequest, BrowserScreenshotResult, BrowserSelectRequest, BrowserSelectResult, BrowserSessionId, BrowserSetValueRequest, BrowserSetValueResult, BrowserSnapshotResult, BrowserTab, BrowserTypeRequest, BrowserWaitRequest, BrowserWaitResult, BrowserScrollRequest, BrowserKeyRequest, BrowserChallenge, ExportedCookie, VisitedPage } from './types.js';
+import type { BrowserA11yRequest, BrowserA11yResult, BrowserCheckRequest, BrowserClearRequest, BrowserClickRequest, BrowserContentRequest, BrowserContentResult, BrowserDownloadRequest, BrowserElementTarget, BrowserExecuteRequest, BrowserExecuteResult, BrowserFillRequest, BrowserFillResult, BrowserGetValueRequest, BrowserGetValueResult, BrowserHistoryEntry, BrowserNavigateRequest, BrowserOpenRequest, BrowserProvider, BrowserScrapeRequest, BrowserScrapeResult, BrowserScreenshotRequest, BrowserScreenshotResult, BrowserPdfRequest, BrowserPdfResult, BrowserTraceRequest, BrowserTraceResult, BrowserVideoRequest, BrowserVideoResult, BrowserNetworkRequest, BrowserNetworkResult, BrowserInstallRequest, BrowserInstallResult, BrowserSelectRequest, BrowserSelectResult, BrowserSessionId, BrowserSetValueRequest, BrowserSetValueResult, BrowserSnapshotResult, BrowserTab, BrowserTypeRequest, BrowserWaitRequest, BrowserWaitResult, BrowserScrollRequest, BrowserKeyRequest, BrowserChallenge, ExportedCookie, VisitedPage } from './types.js';
 export { BrowserError, } from './types.js';
 export type { BrowserA11yNode, BrowserA11yRequest, BrowserA11yResult, BrowserChallenge, BrowserCheckRequest, BrowserClearRequest, BrowserClickRequest, BrowserContentFormat, BrowserElementTarget, BrowserGetValueRequest, BrowserGetValueResult, BrowserScrapeField, BrowserScrapeRequest, BrowserScrapeResult, BrowserSelectRequest, BrowserSelectResult, BrowserSetValueRequest, BrowserSetValueResult, BrowserWaitRequest, BrowserWaitResult, BrowserScrollRequest, BrowserKeyRequest, BrowserContentRequest, BrowserContentResult, BrowserDownloadRequest, BrowserExecuteRequest, BrowserExecuteResult, BrowserFillField, BrowserFillRequest, BrowserFillResult, BrowserHistoryEntry, BrowserNavigateRequest, BrowserOpenRequest, BrowserProvider, BrowserScreenshotRequest, BrowserScreenshotResult, BrowserSessionId, BrowserSnapshotElement, BrowserSnapshotResult, BrowserTab, BrowserTypeRequest, ExportedCookie, } from './types.js';
 declare module '@deepseek-ai/cordis' {
@@ -114,6 +114,16 @@ export declare class BrowserRuntime extends Service {
     scrape(session: BrowserSessionId, request: BrowserScrapeRequest, signal?: AbortSignal): Promise<BrowserScrapeResult>;
     /** Capture the current page through the selected provider. */
     screenshot(session: BrowserSessionId, request?: BrowserScreenshotRequest, signal?: AbortSignal): Promise<BrowserScreenshotResult>;
+    /** Print the active tab to a PDF file through the provider. */
+    pdf(session: BrowserSessionId, request: BrowserPdfRequest, signal?: AbortSignal): Promise<BrowserPdfResult>;
+    /** Start or stop a Chrome trace of the active tab through the provider. */
+    trace(session: BrowserSessionId, request: BrowserTraceRequest, signal?: AbortSignal): Promise<BrowserTraceResult>;
+    /** Start or stop a screen recording of the active tab through the provider. */
+    video(session: BrowserSessionId, request: BrowserVideoRequest, signal?: AbortSignal): Promise<BrowserVideoResult>;
+    /** Record, read, or clear the active tab's network log through the provider. */
+    network(session: BrowserSessionId, request: BrowserNetworkRequest, signal?: AbortSignal): Promise<BrowserNetworkResult>;
+    /** Report the installable browser carriers, or install one, through the provider. */
+    install(request?: BrowserInstallRequest, signal?: AbortSignal): Promise<BrowserInstallResult>;
     /** Check for a human-verification challenge on the active tab. */
     detectChallenge(session: BrowserSessionId, signal?: AbortSignal): Promise<BrowserChallenge>;
     /** Return the session's chronological operation log through the provider. */

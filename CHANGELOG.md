@@ -4,6 +4,57 @@
 
 ---
 
+---
+
+# 第四十三轮(2026-10-15,五个新工具 + 一条 CDP 事件通道 + 三处监管缺陷)
+
+本轮把"看得见"和"查得到"分开:前四项是新增能力(导出 PDF、录 trace、录像、看网络),另外加上附着到已运行浏览器的能力,最后把三个一直只在日志里可见的缺陷修掉。
+
+## 一、CDP 事件通道(结构性改动)
+
+在此之前这个宿主只有请求/响应:子进程从不转发 CDP 事件,因此网络、录屏、trace 的 `dataCollected` 三类信息在架构上就取不到。改动是**复用已有的通知通道**,而不是新开一条:
+
+- `rpc-ops.ts`:新增 op `subscribe`(父 → 子:要求转发哪些 CDP 域),通知新增 `cdpEvent` 与 `hostStopping`(子 → 父)。
+- `host-main.ts`:每个视图在 `createView` 里挂一次 `debugger.on('message')`,按视图的域集合过滤后直接写 socket。**事件不排进命令队列**——页面刷屏不能拖住命令,命令卡住也不能堵住事件流;唯一的背压是 socket 积压,超过 8 MiB 即丢弃并计数,下次 `subscribe` 回报 `dropped`。视图销毁、窗口关闭都会清掉订阅。
+- `remote-host.ts`:通知在既有的鉴权分支里分发(与 `userAction` / `viewClosed` 同一处,同样要求先证明持有 spawn token)。
+
+## 二、五个新工具
+
+| 工具 | 通道 | 关键约束 |
+| --- | --- | --- |
+| `browser_pdf` | 请求/响应 + 原生兜底 | 先走 CDP `Page.printToPDF`;**Electron 的内置 CDP 没有这个方法**(实测 `'Page.printToPDF' wasn't found`),故只在该类失败上回退到子进程的 `webContents.printToPDF`。复用 `browser_download` 的落盘准入门;64 MiB 上限;空回复报 `BROWSER_PDF_EMPTY`,绝不写空文件 |
+| `browser_trace` | 事件 | **事件优先**:不请求 `transferMode: ReturnAsStream`(该模式下 Chromium 停发 `dataCollected`,Electron 又不回 stream,实测空文件 2 字节),并在 `Tracing.end` 之后等 `Tracing.tracingComplete` 再落盘 `{ traceEvents: [...] }`;256 MiB 上限,截断时 `truncated: true` 但仍落盘 |
+| `browser_video` | 事件 | `Page.startScreencast` 帧到达即刻 ack,ffmpeg 编码;600 帧 / 512 MiB 上限;编码 120 s 超时并 kill;没有 ffmpeg 报 `BROWSER_VIDEO_NO_FFMPEG` |
+| `browser_network` | 事件 | 环形缓冲(默认 500 / 上限 2000),响应体按需拉取(1 MiB);跨导航后 CDP 遗忘正文时报 `BROWSER_NETWORK_BODY_GONE` |
+| `browser_install` | – | 报告载体或安装 Electron 运行时;**`status` 是观察、`install` 是动作**;`target: system` 明确拒绝(装系统浏览器需要 root) |
+
+**门控的一个取舍**:`browser_network` 与 `browser_install` 只拦"动作"路径(`start`/`stop`/`clear`/`install`),读取已记录的日志、查询载体状态是观察,和 `browser_history` 同等对待——白名单管的是"能做什么",不该顺带把眼睛蒙上。
+
+## 三、附着到已经在跑的浏览器(cdpEndpoint)
+
+配置 `cdpEndpoint`(或环境变量 `DSH_BROWSER_CDP_ENDPOINT`)给出 `ws://…/devtools/browser/<id>` 或 `http://host:port` 时,chrome/edge 载体不再自己拉起浏览器,而是连上去:**不创建、不删除 profile,不 kill 不属于自己的进程**。端点不可达时报 `BROWSER_CDP_ENDPOINT_UNREACHABLE`,并且**绝不回退去启动另一个浏览器**——那会悄悄换成另一个浏览器。
+
+## 四、三处监管缺陷(只在日志里可见,故长期存在)
+
+1. **正常收尾被记成启动失败**。子进程主动退出(最后一个窗口关闭)与崩溃在父进程眼里一样——都是 socket 关闭,于是 `noteStartFailure` 把一次健康会话的结束写成 `browser host start failed (attempt 1)`,还顺手给一个没坏的宿主上了重试时钟。现在子进程在 `window-all-closed` 里先发 `hostStopping` 再退出,父进程据此跳过失败上报。
+2. **一次失败被计两次**。同一次启动失败会从两条路径各报一次(子进程退出、`ready()` 拒绝),两者最多相隔 `READY_TIMEOUT_MS`(20 s),而原来的去重窗口是 **1 s** —— 于是 `attempt 1` 之后紧跟 `attempt 2`,重试阶梯被白白推进一格,并更早走到"放弃立即重试"。改为按**启动代次**去重(身份,不是时间)。
+3. **失败原因被丢掉**。socket 错误、hello 超时、鉴权失败、spawn 失败全部汇成同一句 "the browser host process exited"——日志能对着一个从未退出的进程说它退出了。现在 `fail()` 的真实原因一路传到日志行。
+
+## 五、真实浏览器发现的两个缺陷(单元测试全都漏掉了)
+
+端到端跑真实 Electron 之后才发现,两个都写进了工具表与架构说明:
+
+1. **PDF 从来没能生成**:`Page.printToPDF` 被 Electron 的内置 CDP 拒绝(`wasn't found`),契约里"注册一个 CDP 调用"的假设在这个载体上根本不成立。修法是加一个 `pdf` op,让子进程用自己的 `webContents.printToPDF`,并只在"方法不存在"时回退。
+2. **trace 一直是空文件**:先是 stream 模式吞掉了事件;改成事件优先之后仍然只有 2 字节——因为 `Tracing.end` 的**回复早于数据 flush**。现在等待 `Tracing.tracingComplete`(上限 5 s),并且两种路径统一写成 `{ traceEvents: [...] }`。
+
+同一次运行确认可用的:PDF、网络日志与响应体、录像(13 帧 → h264 640×382 的 MP4,ffprobe 验证)、载体状态报告。
+
+## 六、验证
+
+- 单元/集成:`tests/{trace,video,network,install,cdp-endpoint,event-channel,feature-pdf,provider-features-wiring}.test.mjs`;各模块测试都做过变异验证(注入缺陷后必须挂)。
+- 事件通道与三处缺陷由 `tests/event-channel.test.mjs` 用真实父进程 + 纯 Node 假子进程钉住;其中"一次失败只记一行"的用例把 `READY_TIMEOUT_MS` 压到 1.2 s,否则要等 20 s。
+- 真实 Electron 的端到端跑法在 `scripts/e2e-live.mjs`(与 `scripts/verify-host-compat.mjs` 互补:后者不开浏览器回答"DSH 升级有没有把我们弄坏",前者回答"五个能力在真浏览器里成不成")。**它必须在沙箱外跑**:沙箱里 Chromium 的渲染进程因 `/dev/shm` 起不来。
+
 # 第四十二轮(2026-10-08,三个"能看见的"缺陷:跨会话读错、空白页堆积、升级登出)
 
 0.4.5 发布后,用户连续报了三个现象。**三个都在同一段代码的新实现里**,而它们看着毫不相干——一个是"别的会话读到我这边",一个是"一次开一堆空白页",一个是"升级后所有站点被登出"。前两个实际上是**同一个会话在两种状态下的两种表现**。

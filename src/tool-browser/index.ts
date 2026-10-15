@@ -1307,6 +1307,327 @@ export function apply(ctx: Context, config: Config = {}): void {
     },
   }))
 
+  ctx.tools.register(defineTool({
+    name: 'browser_pdf',
+    description: 'Print the current shared-browser page to a PDF file with Chromium\'s own print pipeline. Writes to savePath, which must resolve inside the configured downloadDir and must not already exist — the same gate as browser_download, and an existing file is never replaced. Returns the written path and its size.',
+    parameters: {
+      savePath: { type: 'string', required: true, description: 'Absolute path of the PDF to write. Must resolve inside the configured downloadDir; an existing file is never overwritten.' },
+      landscape: { type: 'boolean', description: 'Landscape orientation (default portrait).' },
+      printBackground: { type: 'boolean', description: 'Print CSS backgrounds (default true — a designed page usually needs them).' },
+      paperWidth: { type: 'number', description: 'Paper width in inches (default 8.5).' },
+      paperHeight: { type: 'number', description: 'Paper height in inches (default 11).' },
+      marginTop: { type: 'number', description: 'Top margin in inches (default 0.4).' },
+      marginBottom: { type: 'number', description: 'Bottom margin in inches (default 0.4).' },
+      marginLeft: { type: 'number', description: 'Left margin in inches (default 0.4).' },
+      marginRight: { type: 'number', description: 'Right margin in inches (default 0.4).' },
+      scale: { type: 'number', description: 'Rendering scale, 0.1-2 (default 1).' },
+      pageRanges: { type: 'string', description: "Paper ranges to print, e.g. '1-5, 8, 11-13'." },
+      preferCSSPageSize: { type: 'boolean', description: "Honour the page's own @page size instead of the paper options." },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          path: { type: 'string', required: true, description: 'The file that was written.' },
+          bytes: { type: 'number', required: true, description: 'Its size in bytes.' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: `PDF written to ${value.path} (${String(value.bytes)} bytes).` }],
+    },
+    timeoutMs,
+    isConcurrencySafe: () => false,
+    async execute(args, exec) {
+      assertAllowed(state, 'browser_pdf', taskKey(exec))
+      const browser = ctx.get('browser')
+      if (browser === undefined) throw new Error('tool-browser: browser service unavailable')
+      const session = await ensureSession(browser, state, taskKey(exec), agentOf(exec))
+      const result = await browser.pdf(session, {
+        savePath: args.savePath,
+        ...args.landscape !== undefined ? { landscape: args.landscape } : {},
+        ...args.printBackground !== undefined ? { printBackground: args.printBackground } : {},
+        ...args.paperWidth !== undefined ? { paperWidth: args.paperWidth } : {},
+        ...args.paperHeight !== undefined ? { paperHeight: args.paperHeight } : {},
+        ...args.marginTop !== undefined ? { marginTop: args.marginTop } : {},
+        ...args.marginBottom !== undefined ? { marginBottom: args.marginBottom } : {},
+        ...args.marginLeft !== undefined ? { marginLeft: args.marginLeft } : {},
+        ...args.marginRight !== undefined ? { marginRight: args.marginRight } : {},
+        ...args.scale !== undefined ? { scale: args.scale } : {},
+        ...args.pageRanges !== undefined ? { pageRanges: args.pageRanges } : {},
+        ...args.preferCSSPageSize !== undefined ? { preferCSSPageSize: args.preferCSSPageSize } : {},
+      }, exec.signal)
+      return { path: result.path, bytes: result.bytes }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'browser_trace',
+    description: 'Record a Chrome trace of the current tab and write it as JSON. action="start" begins recording (no path needed); action="stop" ends it and writes the trace to savePath (same admission gate as browser_download). Read the result with the Chrome DevTools performance panel or any Chrome trace viewer.',
+    parameters: {
+      action: { type: 'string', enum: ['start', 'stop'], required: true, description: 'start begins a trace; stop ends it and writes the file.' },
+      savePath: { type: 'string', description: 'Absolute path for the trace JSON. Required on stop, ignored on start. Must resolve inside the configured downloadDir; an existing file is never overwritten.' },
+      categories: { type: 'array', items: { type: 'string' }, description: 'CDP trace categories (default: the devtools timeline set).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          tracing: { type: 'boolean', required: true, description: 'Whether a trace is now being recorded.' },
+          path: { type: 'string', description: 'The written trace file, on a stop that wrote one.' },
+          bytes: { type: 'number', description: 'Its size in bytes.' },
+          truncated: { type: 'boolean', description: 'True when the size cap cut the trace short.' },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.tracing
+          ? 'Trace recording started.'
+          : `Trace written to ${value.path ?? '(no path)'}${value.bytes !== undefined ? ` (${String(value.bytes)} bytes)` : ''}${value.truncated === true ? ' — truncated at the size cap' : ''}.`,
+      }],
+    },
+    timeoutMs,
+    isConcurrencySafe: () => false,
+    async execute(args, exec) {
+      assertAllowed(state, 'browser_trace', taskKey(exec))
+      const browser = ctx.get('browser')
+      if (browser === undefined) throw new Error('tool-browser: browser service unavailable')
+      const session = await ensureSession(browser, state, taskKey(exec), agentOf(exec))
+      const result = await browser.trace(session, {
+        action: args.action,
+        ...args.savePath !== undefined ? { savePath: args.savePath } : {},
+        ...args.categories !== undefined ? { categories: args.categories } : {},
+      }, exec.signal)
+      return {
+        tracing: result.tracing,
+        ...result.path !== undefined ? { path: result.path } : {},
+        ...result.bytes !== undefined ? { bytes: result.bytes } : {},
+        ...result.truncated !== undefined ? { truncated: result.truncated } : {},
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'browser_video',
+    description: 'Record the current tab as an MP4 using CDP screencast frames encoded with ffmpeg. action="start" begins recording; action="stop" ends it and writes the file to savePath (same admission gate as browser_download). Heavy: frames are buffered in memory, so stop within a reasonable time — the caps are 600 frames and 512 MiB, and anything dropped is reported.',
+    parameters: {
+      action: { type: 'string', enum: ['start', 'stop'], required: true, description: 'start begins recording; stop ends it and encodes the file.' },
+      savePath: { type: 'string', description: 'Absolute path for the video. Required on stop, ignored on start. Must resolve inside the configured downloadDir; an existing file is never overwritten.' },
+      quality: { type: 'number', description: 'JPEG frame quality 1-100 (default 70).' },
+      maxWidth: { type: 'number', description: 'Downscale frames to this width before encoding.' },
+      maxHeight: { type: 'number', description: 'Downscale frames to this height before encoding.' },
+      fps: { type: 'number', description: 'Encoder output frames per second (default 10).' },
+      maxFrames: { type: 'number', description: 'Cap on buffered frames (default 600).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          recording: { type: 'boolean', required: true, description: 'Whether a recording is in progress.' },
+          path: { type: 'string', description: 'The written video file.' },
+          bytes: { type: 'number', description: 'Its size in bytes.' },
+          frames: { type: 'number', description: 'Frames encoded.' },
+          droppedFrames: { type: 'number', description: 'Frames discarded because a cap was reached.' },
+          durationMs: { type: 'number', description: 'Wall-clock length of the recording.' },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.recording
+          ? 'Recording started.'
+          : `Recording written to ${value.path ?? '(no path)'} (${String(value.frames ?? 0)} frames${value.droppedFrames !== undefined && value.droppedFrames > 0 ? `, ${String(value.droppedFrames)} dropped` : ''}).`,
+      }],
+    },
+    timeoutMs,
+    isConcurrencySafe: () => false,
+    async execute(args, exec) {
+      assertAllowed(state, 'browser_video', taskKey(exec))
+      const browser = ctx.get('browser')
+      if (browser === undefined) throw new Error('tool-browser: browser service unavailable')
+      const session = await ensureSession(browser, state, taskKey(exec), agentOf(exec))
+      const result = await browser.video(session, {
+        action: args.action,
+        ...args.savePath !== undefined ? { savePath: args.savePath } : {},
+        ...args.quality !== undefined ? { quality: args.quality } : {},
+        ...args.maxWidth !== undefined ? { maxWidth: args.maxWidth } : {},
+        ...args.maxHeight !== undefined ? { maxHeight: args.maxHeight } : {},
+        ...args.fps !== undefined ? { fps: args.fps } : {},
+        ...args.maxFrames !== undefined ? { maxFrames: args.maxFrames } : {},
+      }, exec.signal)
+      return {
+        recording: result.recording,
+        ...result.path !== undefined ? { path: result.path } : {},
+        ...result.bytes !== undefined ? { bytes: result.bytes } : {},
+        ...result.frames !== undefined ? { frames: result.frames } : {},
+        ...result.droppedFrames !== undefined ? { droppedFrames: result.droppedFrames } : {},
+        ...result.durationMs !== undefined ? { durationMs: result.durationMs } : {},
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'browser_network',
+    description: 'Inspect the current tab\'s network activity. action="start" enables recording, action="list" returns the requests seen so far (newest first, filterable by url pattern/resource type/method/status/failed), action="body" fetches one response body by requestId, action="clear" empties the log, action="stop" disables recording. Only "start"/"stop"/"clear" are actions; reading an already-recorded log is an observation and is never blocked by an allow-list. Bodies are fetched on demand only and CDP forgets them across a navigation.',
+    parameters: {
+      action: { type: 'string', enum: ['start', 'stop', 'list', 'body', 'clear'], required: true, description: 'Which operation to run.' },
+      urlPattern: { type: 'string', description: 'URL filter: a substring, or a /regex/ literal.' },
+      resourceType: { type: 'string', description: 'Keep only this CDP resource type (Document, XHR, Script, Image, ...).' },
+      method: { type: 'string', description: 'Keep only this HTTP method.' },
+      status: { type: 'number', description: 'Keep only this exact response status.' },
+      onlyFailed: { type: 'boolean', description: 'Keep only failed requests.' },
+      limit: { type: 'number', description: 'Maximum entries to return (default 50, max 200).' },
+      requestId: { type: 'string', description: 'Which request\'s body to fetch, for action="body".' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          recording: { type: 'boolean', required: true, description: 'Whether events are currently being recorded.' },
+          entries: {
+            type: 'array',
+            required: true,
+            description: 'The matching entries, newest first.',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                requestId: { type: 'string', required: true },
+                url: { type: 'string', required: true },
+                method: { type: 'string', required: true },
+                resourceType: { type: 'string' },
+                status: { type: 'number' },
+                statusText: { type: 'string' },
+                mimeType: { type: 'string' },
+                encodedBytes: { type: 'number' },
+                fromCache: { type: 'boolean' },
+                failed: { type: 'string' },
+                startedAtMs: { type: 'number' },
+                durationMs: { type: 'number' },
+              },
+            },
+          },
+          total: { type: 'number', required: true, description: 'How many entries the buffer holds in total, before filtering.' },
+          dropped: { type: 'number', required: true, description: 'How many entries were evicted by the buffer cap.' },
+          body: { type: 'string', description: 'The response body, for action="body".' },
+          base64: { type: 'boolean', description: 'Whether the body is base64-encoded.' },
+          truncated: { type: 'boolean', description: 'Whether the body was cut at the size cap.' },
+        },
+      },
+      render: (_args, value) => {
+        if (value.body !== undefined) {
+          const cap = 20_000
+          const shown = value.body.length > cap ? `${value.body.slice(0, cap)}\n(body truncated at ${String(cap)} of ${String(value.body.length)} characters)` : value.body
+          return [{ type: 'text', text: `${value.base64 === true ? '(base64) ' : ''}${shown}` }]
+        }
+        const head = `${String(value.entries.length)} of ${String(value.total)} recorded request(s)${value.recording ? '' : ' — recording is OFF'}${value.dropped > 0 ? `, ${String(value.dropped)} evicted` : ''}:`
+        const lines = value.entries.map(entry => `${entry.method} ${entry.status !== undefined ? String(entry.status) : entry.failed !== undefined ? 'FAILED' : '...'} ${entry.url}${entry.encodedBytes !== undefined ? ` (${String(entry.encodedBytes)} B)` : ''}`)
+        return [{ type: 'text', text: [head, ...lines].join('\n') }]
+      },
+    },
+    timeoutMs,
+    isConcurrencySafe: () => false,
+    async execute(args, exec) {
+      // Only the acting paths are gated: an allow-list governs what the agent may DO, and
+      // reading a log it already recorded is an observation, exactly like browser_history.
+      if (args.action !== 'list' && args.action !== 'body') {
+        assertAllowed(state, 'browser_network', taskKey(exec))
+      }
+      const browser = ctx.get('browser')
+      if (browser === undefined) throw new Error('tool-browser: browser service unavailable')
+      const session = await ensureSession(browser, state, taskKey(exec), agentOf(exec))
+      const result = await browser.network(session, {
+        action: args.action,
+        ...args.urlPattern !== undefined ? { urlPattern: args.urlPattern } : {},
+        ...args.resourceType !== undefined ? { resourceType: args.resourceType } : {},
+        ...args.method !== undefined ? { method: args.method } : {},
+        ...args.status !== undefined ? { status: args.status } : {},
+        ...args.onlyFailed !== undefined ? { onlyFailed: args.onlyFailed } : {},
+        ...args.limit !== undefined ? { limit: args.limit } : {},
+        ...args.requestId !== undefined ? { requestId: args.requestId } : {},
+      }, exec.signal)
+      return {
+        recording: result.recording,
+        entries: result.entries.map(entry => ({ ...entry })),
+        total: result.total,
+        dropped: result.dropped,
+        ...result.body !== undefined ? { body: result.body } : {},
+        ...result.base64 !== undefined ? { base64: result.base64 } : {},
+        ...result.truncated !== undefined ? { truncated: result.truncated } : {},
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'browser_install',
+    description: 'Report which browsers this installation can drive — the bundled Electron runtime, and any installed Chrome or Edge — or install the bundled Electron runtime when it is missing. action="status" (the default) downloads nothing and is an observation; action="install" with target="electron" runs the Electron package\'s own installer (a real ~100 MB download), and target="system" is refused with the OS-level instruction, because installing a system browser needs root.',
+    parameters: {
+      action: { type: 'string', enum: ['status', 'install'], description: 'status (default) reports; install downloads. Only install is an action.' },
+      target: { type: 'string', enum: ['electron', 'system'], description: 'What to install: the bundled Electron runtime (default), or a system browser (refused, with instructions).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          carriers: {
+            type: 'array',
+            required: true,
+            description: 'Every carrier that was looked for.',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                kind: { type: 'string', required: true },
+                path: { type: 'string' },
+                source: { type: 'string' },
+                version: { type: 'string' },
+                exists: { type: 'boolean', required: true },
+              },
+            },
+          },
+          channel: { type: 'string', required: true, description: 'The carrier channel the settings currently select.' },
+          ready: { type: 'boolean', required: true, description: 'Whether the selected channel has a usable carrier right now.' },
+          notes: { type: 'array', required: true, items: { type: 'string' }, description: 'What the operator has to know: what is missing and the exact command that fixes it.' },
+          installed: {
+            type: 'object',
+            additionalProperties: false,
+            properties: { kind: { type: 'string', required: true }, version: { type: 'string' } },
+            description: 'What an install action actually installed.',
+          },
+        },
+      },
+      render: (_args, value) => {
+        const lines = value.carriers.map(carrier => `${carrier.exists ? 'OK  ' : 'MISS'} ${carrier.kind}${carrier.path !== undefined ? ` — ${carrier.path}` : ''}${carrier.version !== undefined ? ` (${carrier.version})` : ''}`)
+        const head = `carrier channel: ${value.channel} — ${value.ready ? 'ready' : 'not ready'}`
+        return [{ type: 'text', text: [head, ...lines, ...value.notes].join('\n') }]
+      },
+    },
+    timeoutMs,
+    isConcurrencySafe: () => false,
+    async execute(args, exec) {
+      const action = args.action ?? 'status'
+      if (action === 'install') {
+        // status is an observation (the read-only promise); installing is an action.
+        assertAllowed(state, 'browser_install', taskKey(exec))
+      }
+      const browser = ctx.get('browser')
+      if (browser === undefined) throw new Error('tool-browser: browser service unavailable')
+      const result = await browser.install({
+        action,
+        ...args.target !== undefined ? { target: args.target } : {},
+      }, exec.signal)
+      return {
+        carriers: result.carriers.map(carrier => ({ ...carrier })),
+        channel: result.channel,
+        ready: result.ready,
+        notes: [...result.notes],
+        ...result.installed !== undefined ? { installed: { ...result.installed } } : {},
+      }
+    },
+  }))
+
   if (config.tabTools !== false) {
     ctx.tools.register(defineTool({
       name: 'browser_list_tabs',

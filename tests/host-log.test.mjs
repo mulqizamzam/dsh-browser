@@ -15,6 +15,12 @@ import { fileURLToPath } from 'node:url'
 
 import { RemoteElectronViewHost } from '../lib/browser-electron/remote-host.js'
 
+// These tests spawn plain-Node children and need no display. Without this pin a headless
+// system starts an Xvfb per spawn, and headless-display.test.mjs — which asserts machine-wide
+// that a failed spawn leaks no virtual display — counts those displays as leaks when the test
+// files run in parallel. The display pool is global, so the files that do not need it keep out.
+process.env.DISPLAY = process.env.DISPLAY ?? ':77'
+
 // Isolate the whole file and do NOT restore afterwards: `dispose()` kills the
 // child asynchronously, so its exit line is written AFTER the test body returns.
 // Restoring DSH_HOME in a `finally` therefore sent exactly that line to the

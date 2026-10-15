@@ -33,6 +33,16 @@ import type {
   BrowserScrapeResult,
   BrowserScreenshotRequest,
   BrowserScreenshotResult,
+  BrowserPdfRequest,
+  BrowserPdfResult,
+  BrowserTraceRequest,
+  BrowserTraceResult,
+  BrowserVideoRequest,
+  BrowserVideoResult,
+  BrowserNetworkRequest,
+  BrowserNetworkResult,
+  BrowserInstallRequest,
+  BrowserInstallResult,
   BrowserSelectRequest,
   BrowserSelectResult,
   BrowserSessionId,
@@ -334,6 +344,31 @@ export class BrowserRuntime extends Service {
   /** Capture the current page through the selected provider. */
   async screenshot(session: BrowserSessionId, request?: BrowserScreenshotRequest, signal?: AbortSignal): Promise<BrowserScreenshotResult> {
     return this.resolveProvider().screenshot(session, request, signal)
+  }
+
+  /** Print the active tab to a PDF file through the provider. */
+  async pdf(session: BrowserSessionId, request: BrowserPdfRequest, signal?: AbortSignal): Promise<BrowserPdfResult> {
+    return this.resolveProvider().pdf(session, request, signal)
+  }
+
+  /** Start or stop a Chrome trace of the active tab through the provider. */
+  async trace(session: BrowserSessionId, request: BrowserTraceRequest, signal?: AbortSignal): Promise<BrowserTraceResult> {
+    return this.resolveProvider().trace(session, request, signal)
+  }
+
+  /** Start or stop a screen recording of the active tab through the provider. */
+  async video(session: BrowserSessionId, request: BrowserVideoRequest, signal?: AbortSignal): Promise<BrowserVideoResult> {
+    return this.resolveProvider().video(session, request, signal)
+  }
+
+  /** Record, read, or clear the active tab's network log through the provider. */
+  async network(session: BrowserSessionId, request: BrowserNetworkRequest, signal?: AbortSignal): Promise<BrowserNetworkResult> {
+    return this.resolveProvider().network(session, request, signal)
+  }
+
+  /** Report the installable browser carriers, or install one, through the provider. */
+  async install(request: BrowserInstallRequest = {}, signal?: AbortSignal): Promise<BrowserInstallResult> {
+    return this.resolveProvider().install(request, signal)
   }
 
   /** Check for a human-verification challenge on the active tab. */

@@ -91,6 +91,17 @@ declare function electronDistCandidates(pkgRoot: string, platform?: NodeJS.Platf
 declare function electronExeBeside(entry: string, platform?: NodeJS.Platform): string | undefined;
 /** From an electron package root, find its dist executable. */
 declare function electronDistExe(pkgRoot: string, platform?: NodeJS.Platform): string | undefined;
+/** One CDP event the child forwarded from a subscribed view. */
+export interface CdpEvent {
+    /** Window the view belongs to (the session's window group). */
+    readonly windowId: string;
+    /** The view the event came from. */
+    readonly viewId: string;
+    /** CDP method name, e.g. `Network.responseReceived`. */
+    readonly method: string;
+    /** Event payload, verbatim from CDP. */
+    readonly params: unknown;
+}
 /**
  * Self-hosted view host: spawns the plugin's Electron child on first use and
  * keeps it alive until dispose(). Fallback when no desktop shell provides
@@ -119,8 +130,21 @@ export declare class RemoteElectronViewHost implements ElectronBrowserViewHost {
     private startFailures;
     /** Earliest time `ready()` may spawn another child after a failed start. */
     private startRetryAt;
-    /** When the last start failure was reported, used to keep one death to one log line. */
-    private lastStartFailureAt;
+    /**
+     * Identity of the current start attempt, bumped synchronously at the top of `start()`.
+     *
+     * A failure is reported twice for one attempt — the child's exit reports it and `ready()`
+     * rejecting reports it again, up to READY_TIMEOUT_MS apart — so the second report has to be
+     * recognised by WHICH attempt it describes, not by how long ago the first one arrived. A
+     * wall-clock window cannot do that: the gap spans 20 seconds on the timeout path.
+     */
+    private startAttempt;
+    /** The attempt whose failure has already been counted; -1 while none has. */
+    private reportedAttempt;
+    /** Set when the child announced a deliberate shutdown, so its exit is not a failed start. */
+    private deliberateShutdown;
+    /** The provider's CDP event handler; events from subscribed views are routed here. */
+    private cdpEventHandler;
     /** Window groups (windowId per view), re-sent on every materialization so
      *  a restarted child still places views in the right windows. */
     private readonly groups;
@@ -232,6 +256,14 @@ export declare class RemoteElectronViewHost implements ElectronBrowserViewHost {
     onUserAction(handler: (action: BrowserUserAction) => void): void;
     /** Register the provider's handler for windows the human closed. */
     onViewClosed(handler: (windowId: string) => void): void;
+    /**
+     * Register the provider's handler for CDP events forwarded from subscribed views.
+     *
+     * The handler runs on the socket's data path, so it must be cheap: consumers buffer or
+     * count, and anything that needs to await queues that work itself.
+     * @param handler - called once per forwarded event.
+     */
+    onCdpEvent(handler: (event: CdpEvent) => void): void;
     /** Surface a failed user action to the child's toolbar (address bar etc.). */
     notifyUserActionError(windowId: string, message: string): void;
     destroyView(handle: ElectronViewHandle): void;

@@ -18,7 +18,7 @@
 | --- | --- |
 | Why a shared real browser, and how it differs from headless approaches | [Why a shared real browser](docs/why-browser.md) |
 | Installation, configuration, day-to-day use | [User guide](docs/user-guide.md) |
-| All 34 tools: parameters, output, examples | [Tool reference](docs/tool-reference.md) |
+| All 39 tools: parameters, output, examples | [Tool reference](docs/tool-reference.md) |
 | How the seam / provider / tools layers and self-hosting work | [Architecture](docs/architecture.md) |
 | Documentation index and README split | [Docs index](docs/README.md) |
 
@@ -29,7 +29,7 @@
 - **A real page, not a relay**: the page is carried by a **real browser** — on the desktop it is the one in the official sidebar, on plain `dsh web` it is a window the plugin launches, and either can be switched to an **installed Chrome / Edge** in settings. The human sees exactly what the agent is doing and can take over at any time;
 - **One page for both parties** (desktop): the page the agent works on is the **same** page the human sees — no longer a window you cannot see;
 - **Works out of the box**: the carrier is chosen automatically (the desktop sidebar first, otherwise self-hosting), and plain `dsh web` needs no extra configuration at all;
-- **One plugin, one toolset**: after install the agent automatically gets 34 `browser_*` tools (open, a11y tree, wait, semantic/coordinate interaction, scroll, back/forward, batch and single-control form filling, keys, structured scraping, screenshot, download, auth management…).
+- **One plugin, one toolset**: after install the agent automatically gets 39 `browser_*` tools (open, a11y tree, wait, semantic/coordinate interaction, scroll, back/forward, batch and single-control form filling, keys, structured scraping, screenshot, download, PDF export, Chrome traces, video recording, network logs, carrier status/install, auth management…).
 
 In one sentence: **installing the plugin gives you a real browser that is shared with the user and drivable by the agent.**
 
@@ -171,6 +171,12 @@ See the full list in [Tool reference](#tool-reference).
 
 ## Tool reference
 
+| `browser_pdf` | Print the current page to a PDF (paper size, margins, scale, page ranges). CDP `Page.printToPDF` first; where the carrier's CDP does not implement it (Electron's debugger, also used by the desktop sidebar) the child's own `webContents.printToPDF` takes over — only for that "method missing" failure, never as a cover-up for a real CDP error. `savePath` goes through the same admission gate as `browser_download`; 64 MiB cap | ✅ |
+| `browser_trace` | Record a Chrome trace: `start` begins, `stop` writes `{ traceEvents: [...] }` to `savePath`. Deliberately event-based (stream mode suppresses `dataCollected` and Electron returns no stream handle, which together produced an empty file), and `stop` waits for `Tracing.tracingComplete` before assembling; 256 MiB cap | ✅ |
+| `browser_video` | Record the tab as MP4 from CDP screencast frames encoded with ffmpeg. Frames are buffered in memory (600 frames / 512 MiB caps, drops are reported); no ffmpeg is a named error, never a silent empty file | ✅ |
+| `browser_network` | Inspect the tab's network activity: `start` / `stop` / `clear` act, `list` / `body` read a bounded ring buffer (500 entries, bodies fetched on demand). Reading an already-recorded log is an observation and survives any allow-list | ✅ / – |
+| `browser_install` | Report the carriers this install can drive (bundled Electron, installed Chrome/Edge) or install the Electron runtime. `status` is an observation; `install` is an action (~100 MB). `target: "system"` is refused with the OS-level instruction | ✅ / – |
+
 | Tool | Purpose | Guard |
 | --- | --- | --- |
 | `browser_open` | Open a URL; returns a page snapshot. **A further call in the same session opens a new tab** (the first call opens the side panel automatically) | ✅ |
@@ -303,7 +309,7 @@ agent (browser_* tools)
 
 - **Seam** (`browser` row): provides the `ctx.browser` service — provider registration, session lifecycle, error codes — decoupled from any implementation.
 - **Provider** (`browser-electron` row): knows only the one `ElectronBrowserViewHost` seam (create/destroy/show, `sendCommand`), so **switching carrier touches neither the tools, nor the history, nor the cursor, nor the teardown logic**.
-- **Tools** (`tool-browser` row): the 34 model-facing `browser_*` tools, maintaining one browser session per calling task (DSH session).
+- **Tools** (`tool-browser` row): the 39 model-facing `browser_*` tools, maintaining one browser session per calling task (DSH session).
 
 **Self-hosted mode**: without a desktop shell, the plugin spawns its own Electron child process (`host-main.js`) and drives it over loopback TCP JSON-RPC. The RPC is authenticated with a random per-spawn token delivered over **both stdin and an environment variable** — on Windows the Electron GUI process never receives piped stdin, so the env fallback keeps the handshake reliable. The child auto-restarts after a crash; the plugin prefers its own bundled electron package — packaged app executables (e.g. DSH Desktop.exe) are never reused as the spawnable binary, which would launch the app itself and exit immediately; screenshots prefer Electron's native `capturePage` (CDP capture can hang with multiple views in the window); the Electron lookup order follows below (33.x has a compositor defect; ≥ 40 recommended; the electron 44+ package no longer downloads its binary at install time — if it is missing on first use, the tool errors and tells you to run `npx install-electron` first, needs network).
 
@@ -425,7 +431,7 @@ The plugin has one installation per host, and the two are updated separately —
 - Update it the same way you installed it (npm package `dsh-builtin-browser`, the GitHub repo `wqty123/dsh-browser`, or a local directory).
 
 **What is the same on both**
-- The toolset (34 `browser_*` tools), the "Browser" section in Settings, and how browsing history and cookies persist are identical; only the carrier of the page differs (the official sidebar on the desktop, the plugin's own self-hosted window on the web, or an installed browser you picked in settings).
+- The toolset (39 `browser_*` tools), the "Browser" section in Settings, and how browsing history and cookies persist are identical; only the carrier of the page differs (the official sidebar on the desktop, the plugin's own self-hosted window on the web, or an installed browser you picked in settings).
 - Upgrading loses no data: history and settings live in `$DSH_HOME/dsh-builtin-browser-host/` (`history.jsonl`, `settings.json`), and login state sits in the same profile directory — including the `<chrome|edge>-profile` used for an installed browser.
 - If history behaves unexpectedly after an upgrade, check **Settings → Browser**: history defaults to **on**, one-time auto-expand defaults to **on**, closing the browser when a session ends defaults to **off**, and the carrier defaults to **bundled**.
 

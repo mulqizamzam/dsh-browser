@@ -22,7 +22,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { defaultHostMainPath, RemoteElectronViewHost } from './remote-host.js'
 import { DesktopBridgeViewHost } from './desktop-bridge-host.js'
-import { detectBrowser, searchSummary, SystemBrowserViewHost } from './system-browser.js'
+import { cdpEndpointFrom, detectBrowser, searchSummary, SystemBrowserViewHost } from './system-browser.js'
 import { claimEphemeralProfile, ephemeralProfileName, sweepAbandonedEphemeralProfiles } from './ephemeral-profile.js'
 import { MissingSystemBrowserHost } from './missing-system-browser.js'
 import { SettingsStore } from './settings-store.js'
@@ -57,6 +57,15 @@ export interface Config {
   readonly snapshotMaxElements?: number
   /** Maximum content characters before truncation when no maxChars is given. No longer read: the cap is per format (html and json 50 000, otherwise 20 000). */
   readonly contentMaxChars?: number
+  /**
+   * Attach to a browser that is already running, at this CDP endpoint, instead of
+   * launching one. Either its `ws://host:port/devtools/browser/<id>` URL, or an
+   * `http://host:port` origin whose `/json/version` publishes that URL. When set,
+   * nothing is spawned, no profile directory is used, and the browser is never
+   * killed — it is the operator's, not ours. Unset falls back to
+   * `DSH_BROWSER_CDP_ENDPOINT`; if neither is set the carrier launches as before.
+   */
+  readonly cdpEndpoint?: string
 }
 
 export const Config: z<Config> = z.object({
@@ -66,6 +75,7 @@ export const Config: z<Config> = z.object({
   downloadDir: z.string(),
   snapshotMaxElements: z.number(),
   contentMaxChars: z.number(),
+  cdpEndpoint: z.string(),
 })
 
 /**
@@ -182,6 +192,17 @@ export function apply(ctx: Context & { browser: BrowserRuntime }, config: Config
           + 'registered for this context')
       }
     }
+  }
+
+  // An operator-set CDP endpoint outranks every automatic choice, the sidebar included: the
+  // deployment has already said which browser to drive. So nothing is detected, no profile
+  // directory is resolved or claimed, and nothing can take this over later — the channel branch
+  // below and the sidebar discovery after it are both skipped, because either would replace the
+  // browser the operator named with one they did not.
+  const cdpEndpoint = cdpEndpointFrom(config.cdpEndpoint)
+  if (cdpEndpoint !== undefined) {
+    adopt(SystemBrowserViewHost.attach(cdpEndpoint), `will attach to the browser at ${cdpEndpoint}`)
+    return
   }
 
   // A browser the user explicitly asked for outranks every automatic choice: the

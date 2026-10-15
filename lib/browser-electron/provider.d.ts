@@ -8,7 +8,8 @@
  */
 import { type VisitedPage } from './history-store.js';
 import type { BrowserSettings } from './settings-store.js';
-import type { BrowserA11yRequest, BrowserA11yResult, BrowserChallenge, BrowserCheckRequest, BrowserClearRequest, BrowserClickRequest, BrowserContentRequest, BrowserContentResult, BrowserElementTarget, BrowserExecuteRequest, BrowserExecuteResult, BrowserFillRequest, BrowserFillResult, BrowserGetValueRequest, BrowserGetValueResult, BrowserHistoryEntry, BrowserOpenRequest, BrowserProvider, BrowserScrapeRequest, BrowserScrapeResult, BrowserScreenshotRequest, BrowserSelectRequest, BrowserSelectResult, BrowserSessionId, BrowserSetValueRequest, BrowserSetValueResult, BrowserSnapshotResult, BrowserTab, BrowserTypeRequest, BrowserWaitRequest, BrowserWaitResult, BrowserScrollRequest, BrowserKeyRequest, ExportedCookie } from '../browser/types.js';
+import type { BrowserA11yRequest, BrowserA11yResult, BrowserChallenge, BrowserCheckRequest, BrowserClearRequest, BrowserClickRequest, BrowserContentRequest, BrowserContentResult, BrowserElementTarget, BrowserExecuteRequest, BrowserExecuteResult, BrowserFillRequest, BrowserFillResult, BrowserGetValueRequest, BrowserGetValueResult, BrowserHistoryEntry, BrowserOpenRequest, BrowserProvider, BrowserScrapeRequest, BrowserScrapeResult, BrowserScreenshotRequest, BrowserSelectRequest, BrowserSelectResult, BrowserSessionId, BrowserSetValueRequest, BrowserSetValueResult, BrowserSnapshotResult, BrowserTab, BrowserTypeRequest, BrowserWaitRequest, BrowserWaitResult, BrowserScrollRequest, BrowserKeyRequest, ExportedCookie, BrowserPdfRequest, BrowserPdfResult, BrowserTraceRequest, BrowserTraceResult, BrowserVideoRequest, BrowserVideoResult, BrowserNetworkRequest, BrowserNetworkResult, BrowserInstallRequest, BrowserInstallResult } from '../browser/types.js';
+import type { CdpEvent } from './remote-host.js';
 /** Stable provider id registered with `ctx.browser`. */
 export declare const ELECTRON_BROWSER_PROVIDER_ID = "electron";
 /**
@@ -105,6 +106,12 @@ export interface ElectronBrowserViewHost {
      */
     onViewClosed?(handler: (windowId: string) => void): void;
     /**
+     * Optional: receive CDP events forwarded from views the provider subscribed. A host that
+     * cannot forward them omits this, and event-driven features report themselves unsupported.
+     * @param handler - called once per forwarded event, on the socket's data path.
+     */
+    onCdpEvent?(handler: (event: CdpEvent) => void): void;
+    /**
      * Release the service's page(s) without ending the plugin's own lifetime.
      *
      * Only carriers that outlive a browser session need this. A self-hosted window
@@ -182,6 +189,25 @@ export interface ElectronViewHandle {
      * @returns the CDP `result` object.
      */
     sendCommand(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>>;
+    /**
+     * Optional: ask the host to forward these CDP domains for this view, replacing whatever it
+     * was forwarding before ([] stops forwarding).
+     *
+     * Absent on a carrier that cannot forward events — the desktop sidebar drives the shell's
+     * own view — and the event-driven features then refuse with a named error instead of
+     * silently collecting nothing.
+     * @param domains - CDP domain names such as `Network` or `Page`.
+     */
+    subscribe?(domains: readonly string[]): Promise<void>;
+    /**
+     * Optional: render this view to PDF with the carrier's own print pipeline, base64-encoded.
+     *
+     * Present where CDP has no `Page.printToPDF` — the Electron carriers — and absent where it
+     * does (an installed Chrome or Edge), which is why the feature module treats it as a fallback
+     * rather than the primary route.
+     * @param request - the flat request fields (printBackground, paper size, margins, …).
+     */
+    printToPdf?(request: Record<string, unknown>): Promise<string>;
     /**
      * Whether this view's CDP can encode JPEG and honour a quality setting.
      *
@@ -382,6 +408,50 @@ export declare class ElectronBrowserProvider implements BrowserProvider {
     /** Live settings source; absent when nothing owns a settings document. */
     private readonly settingsSource;
     constructor(host: ElectronBrowserViewHost, config?: ElectronBrowserProviderConfig);
+    /** CDP domains each view was subscribed to, so the union can always be re-sent in full. */
+    private readonly subscribedDomains;
+    /** Event listeners per view, registered by the feature modules through {@link featureDeps}. */
+    private readonly cdpViewListeners;
+    /** ffmpeg resolution: undefined = not probed yet, null = probed and unusable. */
+    private ffmpegResolved;
+    /**
+     * Route one forwarded CDP event to the listeners registered for its view.
+     *
+     * Runs on the socket's data path, so listeners are called synchronously and their throws are
+     * swallowed: a bug in one feature must not take down the channel that carries commands.
+     * @param event - the forwarded event.
+     */
+    private dispatchCdpEvent;
+    /**
+     * Release everything the provider and the feature modules hold for a view that is going away.
+     *
+     * The feature buffers are the reason: a screencast recording holds up to 512 MiB of frames, a
+     * network log holds every entry, and each of them owns an event listener that keeps its
+     * closure — and therefore the buffer — reachable. Logs and files survive; only the per-view
+     * runtime state is dropped, which is what a destroyed view can no longer use anyway.
+     * @param viewId - the view that no longer exists.
+     */
+    private releaseViewFeatures;
+    /** The view handle backing `viewId`, across every live session. */
+    private handleForView;
+    /** Write bytes durably: a temp file beside the target, then a rename. */
+    private writeDurably;
+    /** The ffmpeg executable to encode with, or undefined when none is usable. */
+    private resolveFfmpeg;
+    /** The primitives the feature modules are allowed to use. */
+    private featureDeps;
+    /** The machine-scoped primitives the install feature needs. */
+    private installDeps;
+    /** Print the active tab to a PDF file. */
+    pdf(session: BrowserSessionId, request: BrowserPdfRequest, signal?: AbortSignal): Promise<BrowserPdfResult>;
+    /** Start or stop a Chrome trace of the active tab. */
+    trace(session: BrowserSessionId, request: BrowserTraceRequest, signal?: AbortSignal): Promise<BrowserTraceResult>;
+    /** Start or stop a screen recording of the active tab. */
+    video(session: BrowserSessionId, request: BrowserVideoRequest, signal?: AbortSignal): Promise<BrowserVideoResult>;
+    /** Record, read, or clear the active tab's network log. */
+    network(session: BrowserSessionId, request: BrowserNetworkRequest, signal?: AbortSignal): Promise<BrowserNetworkResult>;
+    /** Report the installable browser carriers, or install one. */
+    install(request?: BrowserInstallRequest, signal?: AbortSignal): Promise<BrowserInstallResult>;
     /**
      * Usable when the host says it can back views (the self-hosted host probes
      * for a usable Electron binary; the desktop shell is assumed usable).

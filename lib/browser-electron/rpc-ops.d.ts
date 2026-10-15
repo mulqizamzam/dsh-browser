@@ -11,8 +11,8 @@
  * they agree, which is what makes a one-sided rename fail loudly instead of at run time.
  */
 /** Operations the parent asks the child to perform. */
-export declare const RPC_OPS: readonly ["ping", "createView", "destroyView", "showView", "groupView", "focus", "command", "capture", "download", "flushAuth", "restoreAuth", "navigate", "new-tab", "activate", "close", "back", "forward", "reload", "userActionError"];
+export declare const RPC_OPS: readonly ["ping", "createView", "destroyView", "showView", "groupView", "focus", "command", "capture", "download", "flushAuth", "restoreAuth", "navigate", "new-tab", "activate", "close", "back", "forward", "reload", "userActionError", "subscribe", "pdf"];
 /** Notifications the child sends the parent, which carry no reply. */
-export declare const RPC_NOTIFICATIONS: readonly ["userAction", "viewClosed"];
+export declare const RPC_NOTIFICATIONS: readonly ["userAction", "viewClosed", "cdpEvent", "hostStopping"];
 /** One operation name. */
 export type RpcOp = (typeof RPC_OPS)[number];

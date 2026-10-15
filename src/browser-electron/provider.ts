@@ -8,7 +8,9 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { existsSync, lstatSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { HistoryStore, type VisitedPage } from './history-store.js'
@@ -49,8 +51,27 @@ import type {
   BrowserScrollRequest,
   BrowserKeyRequest,
   ExportedCookie,
+  BrowserPdfRequest,
+  BrowserPdfResult,
+  BrowserTraceRequest,
+  BrowserTraceResult,
+  BrowserVideoRequest,
+  BrowserVideoResult,
+  BrowserNetworkRequest,
+  BrowserNetworkResult,
+  BrowserInstallRequest,
+  BrowserInstallResult,
 } from '../browser/types.js'
 import { BrowserError } from '../browser/types.js'
+import type { CdpEvent } from './remote-host.js'
+import { internals } from './remote-host.js'
+import { detectBrowser } from './system-browser.js'
+import { asRecord, type FeatureDeps, type InstallDeps } from './features/deps.js'
+import { printToPdf } from './features/pdf.js'
+import { inspectNetwork, releaseNetworkView } from './features/network.js'
+import { controlTrace, releaseTraceView } from './features/trace.js'
+import { controlVideo, releaseVideoView } from './features/video.js'
+import { manageInstall } from './features/install.js'
 
 /**
  * Page-context human-verification (CAPTCHA / bot-detection) detection. Runs
@@ -203,6 +224,12 @@ export interface ElectronBrowserViewHost {
    */
   onViewClosed?(handler: (windowId: string) => void): void
   /**
+   * Optional: receive CDP events forwarded from views the provider subscribed. A host that
+   * cannot forward them omits this, and event-driven features report themselves unsupported.
+   * @param handler - called once per forwarded event, on the socket's data path.
+   */
+  onCdpEvent?(handler: (event: CdpEvent) => void): void
+  /**
    * Release the service's page(s) without ending the plugin's own lifetime.
    *
    * Only carriers that outlive a browser session need this. A self-hosted window
@@ -264,6 +291,25 @@ export interface ElectronViewHandle {
    * @returns the CDP `result` object.
    */
   sendCommand(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>>
+  /**
+   * Optional: ask the host to forward these CDP domains for this view, replacing whatever it
+   * was forwarding before ([] stops forwarding).
+   *
+   * Absent on a carrier that cannot forward events — the desktop sidebar drives the shell's
+   * own view — and the event-driven features then refuse with a named error instead of
+   * silently collecting nothing.
+   * @param domains - CDP domain names such as `Network` or `Page`.
+   */
+  subscribe?(domains: readonly string[]): Promise<void>
+  /**
+   * Optional: render this view to PDF with the carrier's own print pipeline, base64-encoded.
+   *
+   * Present where CDP has no `Page.printToPDF` — the Electron carriers — and absent where it
+   * does (an installed Chrome or Edge), which is why the feature module treats it as a fallback
+   * rather than the primary route.
+   * @param request - the flat request fields (printBackground, paper size, margins, …).
+   */
+  printToPdf?(request: Record<string, unknown>): Promise<string>
   /**
    * Whether this view's CDP can encode JPEG and honour a quality setting.
    *
@@ -688,6 +734,223 @@ export class ElectronBrowserProvider implements BrowserProvider {
     // A window the human closed ends the session it showed: the next call opens a
     // clean one instead of driving a page nobody can see.
     this.host.onViewClosed?.(windowId => { void this.handleViewClosed(windowId) })
+    // Forwarded CDP events feed the feature modules (the network log, screencast frames,
+    // trace chunks). Registered once here; the per-view split happens in dispatchCdpEvent.
+    this.host.onCdpEvent?.(event => { this.dispatchCdpEvent(event) })
+  }
+
+  /** CDP domains each view was subscribed to, so the union can always be re-sent in full. */
+  private readonly subscribedDomains = new Map<string, Set<string>>()
+  /** Event listeners per view, registered by the feature modules through {@link featureDeps}. */
+  private readonly cdpViewListeners = new Map<string, Set<(method: string, params: Record<string, unknown>) => void>>()
+  /** ffmpeg resolution: undefined = not probed yet, null = probed and unusable. */
+  private ffmpegResolved: string | null | undefined
+
+  /**
+   * Route one forwarded CDP event to the listeners registered for its view.
+   *
+   * Runs on the socket's data path, so listeners are called synchronously and their throws are
+   * swallowed: a bug in one feature must not take down the channel that carries commands.
+   * @param event - the forwarded event.
+   */
+  private dispatchCdpEvent(event: CdpEvent): void {
+    const listeners = this.cdpViewListeners.get(event.viewId)
+    if (listeners === undefined) return
+    const params = asRecord(event.params)
+    for (const listener of listeners) {
+      try { listener(event.method, params) } catch { /* a listener must never break the socket path */ }
+    }
+  }
+
+  /**
+   * Release everything the provider and the feature modules hold for a view that is going away.
+   *
+   * The feature buffers are the reason: a screencast recording holds up to 512 MiB of frames, a
+   * network log holds every entry, and each of them owns an event listener that keeps its
+   * closure — and therefore the buffer — reachable. Logs and files survive; only the per-view
+   * runtime state is dropped, which is what a destroyed view can no longer use anyway.
+   * @param viewId - the view that no longer exists.
+   */
+  private releaseViewFeatures(viewId: string): void {
+    releaseTraceView(viewId)
+    releaseVideoView(viewId)
+    releaseNetworkView(viewId)
+    this.cdpViewListeners.delete(viewId)
+    this.subscribedDomains.delete(viewId)
+  }
+
+  /** The view handle backing `viewId`, across every live session. */
+  private handleForView(viewId: string): ElectronViewHandle | undefined {
+    for (const session of this.sessions.values()) {
+      for (const tab of session.tabs) {
+        if (tab.handle.id === viewId) return tab.handle
+      }
+    }
+    return undefined
+  }
+
+  /** Write bytes durably: a temp file beside the target, then a rename. */
+  private writeDurably(path: string, data: Buffer): void {
+    const tmp = `${path}.part`
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(tmp, data)
+    try {
+      renameSync(tmp, path)
+    } catch (error) {
+      try { unlinkSync(tmp) } catch { /* already gone */ }
+      throw error
+    }
+  }
+
+  /** The ffmpeg executable to encode with, or undefined when none is usable. */
+  private async resolveFfmpeg(): Promise<string | undefined> {
+    if (this.ffmpegResolved !== undefined) return this.ffmpegResolved ?? undefined
+    const override = process.env.DSH_BROWSER_FFMPEG_PATH
+    const candidate = override !== undefined && override !== '' ? override : 'ffmpeg'
+    const usable = await new Promise<boolean>(resolve => {
+      let settled = false
+      const done = (value: boolean): void => { if (!settled) { settled = true; resolve(value) } }
+      try {
+        const child = spawn(candidate, ['-version'], { stdio: 'ignore' })
+        child.on('error', () => done(false))
+        child.on('exit', code => done(code === 0))
+        const timer = setTimeout(() => { try { child.kill() } catch { /* gone */ } done(false) }, 5_000)
+        timer.unref()
+      } catch { done(false) }
+    })
+    this.ffmpegResolved = usable ? candidate : null
+    return usable ? candidate : undefined
+  }
+
+  /** The primitives the feature modules are allowed to use. */
+  private featureDeps(): FeatureDeps {
+    return {
+      send: async (viewId, method, params, timeoutMs) => {
+        const handle = this.handleForView(viewId)
+        if (handle === undefined) throw new BrowserError(`browser: no live view ${viewId}`, 'BROWSER_VIEW_UNKNOWN')
+        if (timeoutMs === undefined) return await handle.sendCommand(method, params)
+        return await withTimeout(handle.sendCommand(method, params), timeoutMs, undefined, `CDP ${method}`)
+      },
+      subscribe: async (viewId, domains) => {
+        const handle = this.handleForView(viewId)
+        if (handle === undefined) throw new BrowserError(`browser: no live view ${viewId}`, 'BROWSER_VIEW_UNKNOWN')
+        if (handle.subscribe === undefined) {
+          throw new BrowserError(
+            'browser: this carrier cannot forward CDP events, so recording, tracing and network inspection are unavailable here',
+            'BROWSER_EVENTS_UNSUPPORTED',
+          )
+        }
+        const current = this.subscribedDomains.get(viewId) ?? new Set<string>()
+        for (const domain of domains) current.add(domain)
+        this.subscribedDomains.set(viewId, current)
+        // Always the whole set: a restarted host forwards nothing until it is told again, and
+        // re-sending is what makes the subscription survive a recovery.
+        await handle.subscribe([...current])
+      },
+      onEvent: (viewId, listener) => {
+        const set = this.cdpViewListeners.get(viewId) ?? new Set<(method: string, params: Record<string, unknown>) => void>()
+        set.add(listener)
+        this.cdpViewListeners.set(viewId, set)
+        return () => {
+          const live = this.cdpViewListeners.get(viewId)
+          if (live === undefined) return
+          live.delete(listener)
+          if (live.size === 0) this.cdpViewListeners.delete(viewId)
+        }
+      },
+      nativePdf: async (viewId, request) => {
+        const handle = this.handleForView(viewId)
+        if (handle === undefined) throw new BrowserError(`browser: no live view ${viewId}`, 'BROWSER_VIEW_UNKNOWN')
+        if (handle.printToPdf === undefined) {
+          throw new BrowserError('browser: this carrier has no print pipeline for PDFs', 'BROWSER_PDF_UNSUPPORTED')
+        }
+        return { base64: await handle.printToPdf({ ...request }) }
+      },
+      admit: (savePath, kind) => this.admitSavePath(savePath, kind),
+      ffmpegPath: () => this.resolveFfmpeg(),
+      writeFile: (path, data) => this.writeDurably(path, data),
+    }
+  }
+
+  /** The machine-scoped primitives the install feature needs. */
+  private installDeps(): InstallDeps {
+    return {
+      channel: this.settingsSource?.().browser.channel ?? 'bundled',
+      resolveElectron: () => {
+        try {
+          const path = internals.resolveElectronPath()
+          return { path, exists: existsSync(path) }
+        } catch {
+          // No spawnable Electron binary anywhere: the feature reports that, with the command
+          // that fixes it, rather than throwing out of a status call.
+          return undefined
+        }
+      },
+      detectSystemBrowser: kind => {
+        const found = detectBrowser(kind, process.env, process.platform)
+        return found === undefined ? undefined : { path: found.path }
+      },
+      installElectron: async () => {
+        // The electron package ships its own installer, and running it is exactly what the
+        // documented `npx install-electron` step does — without depending on npx, a shell, or
+        // a writable global prefix.
+        const script = fileURLToPath(new URL('../../node_modules/electron/install.js', import.meta.url))
+        if (!existsSync(script)) {
+          return { ok: false, output: `the bundled electron package has no install.js at ${script}` }
+        }
+        return await new Promise<{ ok: boolean; output: string }>(resolve => {
+          let output = ''
+          const cap = 8_000
+          const collect = (chunk: Buffer | string): void => {
+            if (output.length < cap) output += String(chunk)
+          }
+          const child = spawn(process.execPath, [script], { cwd: dirname(script), stdio: ['ignore', 'pipe', 'pipe'] })
+          child.stdout.on('data', collect)
+          child.stderr.on('data', collect)
+          child.on('error', error => resolve({ ok: false, output: `${output}
+${String(error)}`.trim() }))
+          child.on('exit', code => resolve({ ok: code === 0, output: output.trim() }))
+        })
+      },
+    }
+  }
+
+  /** Print the active tab to a PDF file. */
+  async pdf(session: BrowserSessionId, request: BrowserPdfRequest, signal?: AbortSignal): Promise<BrowserPdfResult> {
+    const s = this.session(session)
+    const { handle } = this.activeTab(s)
+    signal?.throwIfAborted()
+    return await printToPdf(this.featureDeps(), handle.id, request)
+  }
+
+  /** Start or stop a Chrome trace of the active tab. */
+  async trace(session: BrowserSessionId, request: BrowserTraceRequest, signal?: AbortSignal): Promise<BrowserTraceResult> {
+    const s = this.session(session)
+    const { handle } = this.activeTab(s)
+    signal?.throwIfAborted()
+    return await controlTrace(this.featureDeps(), handle.id, request)
+  }
+
+  /** Start or stop a screen recording of the active tab. */
+  async video(session: BrowserSessionId, request: BrowserVideoRequest, signal?: AbortSignal): Promise<BrowserVideoResult> {
+    const s = this.session(session)
+    const { handle } = this.activeTab(s)
+    signal?.throwIfAborted()
+    return await controlVideo(this.featureDeps(), handle.id, request)
+  }
+
+  /** Record, read, or clear the active tab's network log. */
+  async network(session: BrowserSessionId, request: BrowserNetworkRequest, signal?: AbortSignal): Promise<BrowserNetworkResult> {
+    const s = this.session(session)
+    const { handle } = this.activeTab(s)
+    signal?.throwIfAborted()
+    return await inspectNetwork(this.featureDeps(), handle.id, request)
+  }
+
+  /** Report the installable browser carriers, or install one. */
+  async install(request: BrowserInstallRequest = {}, signal?: AbortSignal): Promise<BrowserInstallResult> {
+    signal?.throwIfAborted()
+    return await manageInstall(this.installDeps(), request)
   }
 
   /**
@@ -762,6 +1025,7 @@ export class ElectronBrowserProvider implements BrowserProvider {
     const removed = s.tabs[index]
     if (removed !== undefined) {
       s.tabs.splice(index, 1)
+      this.releaseViewFeatures(removed.handle.id)
       this.host.destroyView(removed.handle)
     }
     if (s.tabs.length === 0) {
@@ -814,7 +1078,10 @@ export class ElectronBrowserProvider implements BrowserProvider {
   /** Close every tab and reset to one blank tab. */
   reset(session: BrowserSessionId): Promise<void> {
     const s = this.session(session)
-    for (const tab of s.tabs) this.host.destroyView(tab.handle)
+    for (const tab of s.tabs) {
+      this.releaseViewFeatures(tab.handle.id)
+      this.host.destroyView(tab.handle)
+    }
     s.tabs.length = 0
     this.newTab(s)
     s.activeIndex = 0
@@ -2555,8 +2822,16 @@ export class ElectronBrowserProvider implements BrowserProvider {
    * @returns the resolved absolute target path.
    * @throws BrowserError when the path is relative, outside the directory, or occupied.
    */
-  private admitSavePath(savePath: string, kind: 'download' | 'screenshot'): string {
-    const code = kind === 'download' ? 'BROWSER_DOWNLOAD_BLOCKED' : 'BROWSER_SCREENSHOT_BLOCKED'
+  private admitSavePath(savePath: string, kind: 'download' | 'screenshot' | 'pdf' | 'trace' | 'video'): string {
+    const code = kind === 'download'
+      ? 'BROWSER_DOWNLOAD_BLOCKED'
+      : kind === 'pdf'
+        ? 'BROWSER_PDF_BLOCKED'
+        : kind === 'trace'
+          ? 'BROWSER_TRACE_BLOCKED'
+          : kind === 'video'
+            ? 'BROWSER_VIDEO_BLOCKED'
+            : 'BROWSER_SCREENSHOT_BLOCKED'
     if (!isAbsolute(savePath)) {
       throw new BrowserError(`browser: ${kind} savePath must be an absolute path`, code)
     }
@@ -3081,7 +3356,10 @@ export class ElectronBrowserProvider implements BrowserProvider {
     const existing = this.sessions.get(session)
     if (existing !== undefined) {
       this.sessions.delete(session)
-      for (const tab of existing.tabs) this.host.destroyView(tab.handle)
+      for (const tab of existing.tabs) {
+        this.releaseViewFeatures(tab.handle.id)
+        this.host.destroyView(tab.handle)
+      }
       // Releasing the browser at session end is a setting, not fixed behaviour
       // (requirements §3). A self-hosted carrier already tore its window down with
       // the views above; the desktop's sidebar does not, so it is asked explicitly

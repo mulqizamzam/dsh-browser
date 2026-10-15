@@ -21,6 +21,8 @@ const REGISTERED = [
   'browser_screenshot', 'browser_scroll', 'browser_select', 'browser_session',
   'browser_set_value', 'browser_snapshot', 'browser_switch_tab', 'browser_type',
   'browser_visited', 'browser_wait',
+  // The five feature tools added with the tracing/video/network/PDF/install work.
+  'browser_pdf', 'browser_trace', 'browser_video', 'browser_network', 'browser_install',
 ]
 
 test('the read-only set contains only tools that exist', () => {

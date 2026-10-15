@@ -32,10 +32,12 @@ export const RPC_OPS = [
   'forward',
   'reload',
   'userActionError',
+  'subscribe',
+  'pdf',
 ] as const
 
 /** Notifications the child sends the parent, which carry no reply. */
-export const RPC_NOTIFICATIONS = ['userAction', 'viewClosed'] as const
+export const RPC_NOTIFICATIONS = ['userAction', 'viewClosed', 'cdpEvent', 'hostStopping'] as const
 
 /** One operation name. */
 export type RpcOp = (typeof RPC_OPS)[number]
