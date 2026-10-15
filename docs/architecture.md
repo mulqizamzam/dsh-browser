@@ -76,6 +76,15 @@ RemoteElectronViewHost  ──TCP JSON-RPC──▶  host-main.js
 - **孤儿防护**:父进程断开时子进程自动退出,不留僵尸窗口;
 - **cookie 落盘**:子进程使用独立 userData 目录(`<DSH_HOME>/dsh-builtin-browser-host`),登录态跨重启保留(另有 `browser_auth` 手动导出/恢复)。
 
+## CDP 事件通道与两处"原生兜底"
+
+宿主原来只有请求/响应,事件在架构上就取不到(网络、录屏、trace 的 `dataCollected` 都属于这一类)。现在子进程按视图转发 CDP 事件,父进程在**既有的鉴权分支**里分发(与 `userAction` / `viewClosed` 同一处,同样要求先证明持有 spawn token)。
+
+- **订阅与背压**:父进程发 `subscribe { viewId, domains }`,只转发被要求的域;视图销毁或窗口关闭即清掉。**事件不排进命令队列**,所以刷屏的页面拖不住命令、卡住的命令也堵不住事件;唯一的背压是 socket 积压——超过 8 MiB 丢弃并计数,下次 `subscribe` 回报 `dropped`。
+- **PDF 的原生兜底**:`Page.printToPDF` 在 Electron 的内置 CDP 上**不存在**(Electron 44 实测:`Error: 'Page.printToPDF' wasn't found`),桌面侧栏驱动的也是同一个 debugger。于是只在这类"方法不存在"的失败上回退到子进程自己的 `webContents.printToPDF`;真正的 CDP 错误照原样报出。
+- **trace 的事件优先**:`transferMode: 'ReturnAsStream'` 会让 Chromium **停止发送** `Tracing.dataCollected`,而 Electron 的 `Tracing.end` 也不返回 stream——实测写出的是一份空文件(2 字节)。现在默认走事件通道,并且 `Tracing.end` 之后**还要等 `Tracing.tracingComplete`**(数据在回复之后才 flush,上限 5 s),再按 `{ traceEvents: [...] }` 落盘。
+- **附着模式**:配置 `cdpEndpoint`(或环境变量 `DSH_BROWSER_CDP_ENDPOINT`)时不再启动浏览器,而是连上已经在跑的那个:不创建、不删除 profile,退出时也不 kill——用显式的 `ownsBrowser` 标志表达归属,而不是靠注释。端点不可达报 `BROWSER_CDP_ENDPOINT_UNREACHABLE`,并且**不回退**去启动另一个浏览器。
+
 ## 关键设计决策
 
 | 决策 | 原因 |

@@ -1,6 +1,6 @@
-// Trace capture: `Tracing.start` with ReturnAsStream, drained through `IO.read`, with the
-// `Tracing.dataCollected` channel as the fallback and the admitted save path as the only place
-// bytes may land.
+// Trace capture: events first (stream mode is honoured only when a carrier returns a handle),
+// drained through `IO.read` when one does, and the admitted save path as the only place bytes
+// may land.
 //
 // The provider hands a feature a fresh deps object per call, so `controlTrace` keeps its
 // per-view state in the module. Every test therefore uses its own view id: two tests sharing
@@ -278,13 +278,16 @@ test('start does not ask for stream transfer, which costs every event on Electro
   // stops emitting `Tracing.dataCollected`, AND Electron 44's `Tracing.end` handed back no
   // stream handle — so a trace of a real page wrote 2 bytes and zero events. Events are the
   // transport that exists on every carrier, so the request must not ask for the stream.
-  const { deps, calls } = makeDeps()
+  const { deps, calls, emit } = makeDeps()
   await controlTrace(deps, 'view-stream-mode', { action: 'start' })
   const start = calls.send.find(call => call.method === 'Tracing.start')
   assert.ok(start !== undefined, 'Tracing.start was sent')
   assert.ok(!('transferMode' in start.params), `transferMode must not be requested, got ${JSON.stringify(start.params)}`)
   assert.equal(typeof start.params.categories, 'string', 'the category set still travels')
-  await controlTrace(deps, 'view-stream-mode', { action: 'stop', savePath: '/admitted/trace.json' })
+  emit('Tracing.dataCollected', { value: [{ name: 'work' }] })
+  emit('Tracing.tracingComplete', {})
+  const result = await controlTrace(deps, 'view-stream-mode', { action: 'stop', savePath: '/admitted/trace.json' })
+  assert.equal(result.bytes > 2, true, 'what the carrier handed over was written')
 })
 
 test('the flush that arrives after Tracing.end is awaited, not lost', async () => {
@@ -325,4 +328,21 @@ test('a carrier that never sends tracingComplete still gets its file, after the 
   assert.deepEqual(JSON.parse(h.calls.writeFile[0].data.toString('utf8')), { traceEvents: [{ name: 'partial' }] }, 'what arrived is still written')
   assert.ok(elapsed >= 4_000, `the flush budget was waited out (${String(elapsed)}ms)`)
   assert.ok(elapsed < 15_000, `but it is bounded (${String(elapsed)}ms)`)
+})
+
+test('a carrier that hands over nothing is an error, not an empty success', async () => {
+  // Found by an adversarial probe: `Tracing.start` accepted, `Tracing.end` answered, zero events
+  // — and the tool returned success with an 18-byte `{"traceEvents":[]}`, indistinguishable from
+  // a real trace of an idle page. Silence is the one outcome this feature must not report as
+  // success.
+  const h = makeDeps({ endReply: {} })
+  await controlTrace(h.deps, 'view-silent', { action: 'start' })
+  await assert.rejects(
+    controlTrace(h.deps, 'view-silent', { action: 'stop', savePath: 'trace.json' }),
+    error => {
+      assert.equal(error.code, 'BROWSER_TRACE_EMPTY')
+      return true
+    },
+  )
+  assert.equal(h.calls.writeFile.length, 0, 'nothing was written')
 })

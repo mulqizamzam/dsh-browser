@@ -91,6 +91,20 @@ declare function electronDistCandidates(pkgRoot: string, platform?: NodeJS.Platf
 declare function electronExeBeside(entry: string, platform?: NodeJS.Platform): string | undefined;
 /** From an electron package root, find its dist executable. */
 declare function electronDistExe(pkgRoot: string, platform?: NodeJS.Platform): string | undefined;
+/**
+ * Whether a failure report describes the current start attempt for the first time.
+ *
+ * Identity, not elapsed time. The same attempt reports its failure twice — the child dies, and
+ * `ready()` rejects — and those two reports can be a whole READY_TIMEOUT_MS apart, while a report
+ * about a superseded attempt must never be charged to the current one. Exported through
+ * {@link internals} because a clock-based version of this rule cannot be told apart from this one
+ * by any test that would have to wait for real time to pass.
+ * @param attempt - the attempt the report is about.
+ * @param currentAttempt - the attempt the host is on now.
+ * @param reportedAttempt - the attempt whose failure was already counted, or -1.
+ * @returns true when this report is news.
+ */
+declare function isNewStartFailure(attempt: number, currentAttempt: number, reportedAttempt: number): boolean;
 /** One CDP event the child forwarded from a subscribed view. */
 export interface CdpEvent {
     /** Window the view belongs to (the session's window group). */
@@ -278,6 +292,7 @@ export declare function defaultHostMainPath(): string;
  * steps; `resolveElectronPath` is the full resolution order.
  */
 export declare const internals: {
+    isNewStartFailure: typeof isNewStartFailure;
     electronDistCandidates: typeof electronDistCandidates;
     electronDistExe: typeof electronDistExe;
     electronExeBeside: typeof electronExeBeside;

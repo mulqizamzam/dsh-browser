@@ -19,8 +19,15 @@ import { withTimeout, type FeatureDeps } from './deps.js'
  */
 const MAX_PDF_BYTES = 64 * 1024 * 1024
 
-/** CDP's way of saying this debugger does not implement the method at all. */
-const METHOD_NOT_IMPLEMENTED = /wasn't found|not found|not supported|is not available|unknown method/i
+/**
+ * CDP's way of saying this debugger does not implement the method at all.
+ *
+ * Narrow on purpose. A bare `not found` also matches ordinary CDP errors — "Session with given
+ * id not found", "Frame with the given id was not found" — and matching those would send a
+ * genuine failure down the native path instead of reporting it, which is the opposite of what
+ * the fallback is for. Only the phrasings that mean "no such method" are listed.
+ */
+const METHOD_NOT_IMPLEMENTED = /wasn't found|isn't found|method not found|unknown method|is not available in this (target|debugger)/i
 
 /** Page rendering plus PDF assembly; the tool's own budget is larger than this. */
 const PDF_TIMEOUT_MS = 45_000

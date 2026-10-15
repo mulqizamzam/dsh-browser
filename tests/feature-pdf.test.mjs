@@ -183,3 +183,22 @@ test('a real CDP failure is not papered over by the native pipeline', async () =
   })
   assert.equal(nativeCalled, false, 'only a missing method falls back; a genuine error does not')
 })
+
+test('a genuine CDP "not found" error does NOT take the native fallback', async () => {
+  // An adversarial probe caught the first version of this trigger: a bare `not found` also
+  // matches ordinary CDP failures, and those were being sent down the native path instead of
+  // reported. Only phrases that mean "no such method" may fall back.
+  for (const message of ['Error: Session with given id not found.', 'Error: Frame with the given id was not found.']) {
+    let nativeCalled = false
+    const deps = makeDeps({
+      send: async () => { throw new Error(message) },
+      nativePdf: async () => { nativeCalled = true; return { base64: '' } },
+    })
+    await assert.rejects(printToPdf(deps, 'view-9', { savePath: '/tmp/x.pdf' }), error => {
+      assert.equal(error.code, 'BROWSER_PDF_FAILED', `${message} is a CDP failure`)
+      assert.match(String(error.message), /not found/)
+      return true
+    })
+    assert.equal(nativeCalled, false, `no fallback for: ${message}`)
+  }
+})

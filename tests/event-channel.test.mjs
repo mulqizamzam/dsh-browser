@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { RemoteElectronViewHost } from '../lib/browser-electron/remote-host.js'
+import { internals, RemoteElectronViewHost } from '../lib/browser-electron/remote-host.js'
 
 // Module scope on purpose, not a `before()` hook: the host reads DSH_HOME when it writes, and
 // a hook that runs after the first test body would already be too late. Without isolation the
@@ -117,4 +117,28 @@ test('one failed start is counted once, however far apart its two reports are', 
     host.dispose()
     delete process.env.DSH_BROWSER_READY_TIMEOUT_MS
   }
+})
+
+test('a failure report counts once per attempt, and a stale attempt never counts', () => {
+  // The rule is identity, not a wall-clock window. It is pinned directly because the integration
+  // test above cannot see the difference: with a real child, both reports of one attempt land in
+  // the same millisecond, so a 1 s window would pass it too (an adversarial probe showed
+  // exactly that). Two attempts are "far apart" here by construction, not by waiting.
+  const { isNewStartFailure } = internals
+  assert.equal(isNewStartFailure(7, 7, -1), true, 'the first report about the current attempt is news')
+  assert.equal(isNewStartFailure(7, 7, 7), false, 'a second report about the same attempt is not')
+  assert.equal(isNewStartFailure(6, 7, 6), false, 'a report about a superseded attempt is dropped')
+  assert.equal(isNewStartFailure(8, 8, 7), true, 'the next attempt counts again')
+})
+
+test('the child filters forwarded events by the subscribed domains and cleans up after itself', () => {
+  // The Electron-free fixture cannot exercise the real child's filter, so the contract is pinned
+  // at the source: an adversarial probe correctly pointed out that "only subscribed domains are
+  // forwarded" rested on code reading alone.
+  const source = readFileSync(new URL('../src/browser-electron/host-main.ts', import.meta.url), 'utf8')
+  assert.match(source, /debugger\.on\('message'/, 'the forwarder is installed on the view debugger')
+  assert.match(source, /subscription\.domains\.has\(domain\)/, 'a domain the parent did not ask for is dropped')
+  assert.match(source, /subscriptions\.delete\(viewId\)/, 'destroying a view drops its subscription')
+  assert.match(source, /CDP_EVENT_BACKLOG_BYTES/, 'the socket backlog is capped')
+  assert.match(source, /subscription\.dropped \+= 1/, 'dropped events are counted')
 })

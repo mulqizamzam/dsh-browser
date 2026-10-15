@@ -816,6 +816,23 @@ class ElectronChildClient {
   }
 }
 
+/**
+ * Whether a failure report describes the current start attempt for the first time.
+ *
+ * Identity, not elapsed time. The same attempt reports its failure twice — the child dies, and
+ * `ready()` rejects — and those two reports can be a whole READY_TIMEOUT_MS apart, while a report
+ * about a superseded attempt must never be charged to the current one. Exported through
+ * {@link internals} because a clock-based version of this rule cannot be told apart from this one
+ * by any test that would have to wait for real time to pass.
+ * @param attempt - the attempt the report is about.
+ * @param currentAttempt - the attempt the host is on now.
+ * @param reportedAttempt - the attempt whose failure was already counted, or -1.
+ * @returns true when this report is news.
+ */
+function isNewStartFailure(attempt: number, currentAttempt: number, reportedAttempt: number): boolean {
+  return attempt === currentAttempt && reportedAttempt !== attempt
+}
+
 /** One CDP event the child forwarded from a subscribed view. */
 export interface CdpEvent {
   /** Window the view belongs to (the session's window group). */
@@ -1151,7 +1168,7 @@ export class RemoteElectronViewHost implements ElectronBrowserViewHost {
     // START_RETRY_SCHEDULE_MS and reaching "giving up on immediate retries" sooner than the
     // schedule intends. A stale attempt is dropped here too, so a report that arrives after
     // the next start began cannot be charged to it.
-    if (attempt !== this.startAttempt || this.reportedAttempt === attempt) return
+    if (!isNewStartFailure(attempt, this.startAttempt, this.reportedAttempt)) return
     this.reportedAttempt = attempt
     //
     const failureAt = Date.now()
@@ -1606,6 +1623,7 @@ export function defaultHostMainPath(): string {
  * steps; `resolveElectronPath` is the full resolution order.
  */
 export const internals = {
+  isNewStartFailure,
   electronDistCandidates,
   electronDistExe,
   electronExeBeside,

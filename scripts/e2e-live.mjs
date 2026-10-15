@@ -43,7 +43,11 @@ const { ElectronBrowserProvider } = await import(join(repo, 'lib/browser-electro
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
 const base = `http://127.0.0.1:${server.address().port}/`
 
-process.env.DSH_HOME = process.env.DSH_HOME ?? join(workDir, 'dsh-home')
+// Isolated UNCONDITIONALLY, not `??=`: the host child appends a spawn/exit line per start to
+// `$DSH_HOME/logs/dsh-builtin-browser-host.log`, which is the very log an operator reads to
+// diagnose a crash loop. An earlier version of this script inherited the ambient DSH_HOME and
+// wrote its own runs into that file.
+process.env.DSH_HOME = join(workDir, 'dsh-home')
 mkdirSync(process.env.DSH_HOME, { recursive: true })
 
 const host = new RemoteElectronViewHost(join(repo, 'lib/browser-electron/host-main.js'), join(repo, 'node_modules/electron/dist/electron'))
@@ -99,7 +103,9 @@ try {
 
 // ---------------------------------------------------------------- trace
 try {
-  await provider.trace(session, { action: 'start' })
+  // More than the timeline default: a script-only workload on a headless carrier records
+  // almost nothing under `devtools.timeline` alone (measured: one metadata event).
+  await provider.trace(session, { action: 'start', categories: ['devtools.timeline', 'v8', 'blink', 'devtools.timeline.async'] })
   await provider.execute(session, { script: 'for (let i = 0; i < 5000; i++) document.body.dataset.x = String(i)' })
   const trace = await provider.trace(session, { action: 'stop', savePath: join(workDir, 'trace.json') })
   let events = 0
