@@ -826,3 +826,15 @@ export declare class ElectronBrowserProvider implements BrowserProvider {
     /** Read the current URL of a view through CDP. */
     private currentUrl;
 }
+/**
+ * Find an ffmpeg to encode with, or explain what was tried.
+ *
+ * A PATH lookup alone is not enough here: measured on this machine, `spawn('ffmpeg')` from inside
+ * the running plugin process failed while `/usr/bin/ffmpeg` was present and ran fine under the
+ * process's own environment reproduced outside it. The cause was never pinned down, so this does
+ * not depend on PATH being usable: the override, then PATH, then the conventional install
+ * locations — the same shape the system-browser detection uses.
+ * @param env - environment to read the override and PATH from (injected for tests).
+ * @returns the executable to spawn, or undefined when nothing answered.
+ */
+export declare function resolveFfmpegExecutable(env?: NodeJS.ProcessEnv): Promise<string | undefined>;

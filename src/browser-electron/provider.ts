@@ -805,21 +805,9 @@ export class ElectronBrowserProvider implements BrowserProvider {
   /** The ffmpeg executable to encode with, or undefined when none is usable. */
   private async resolveFfmpeg(): Promise<string | undefined> {
     if (this.ffmpegResolved !== undefined) return this.ffmpegResolved ?? undefined
-    const override = process.env.DSH_BROWSER_FFMPEG_PATH
-    const candidate = override !== undefined && override !== '' ? override : 'ffmpeg'
-    const usable = await new Promise<boolean>(resolve => {
-      let settled = false
-      const done = (value: boolean): void => { if (!settled) { settled = true; resolve(value) } }
-      try {
-        const child = spawn(candidate, ['-version'], { stdio: 'ignore' })
-        child.on('error', () => done(false))
-        child.on('exit', code => done(code === 0))
-        const timer = setTimeout(() => { try { child.kill() } catch { /* gone */ } done(false) }, 5_000)
-        timer.unref()
-      } catch { done(false) }
-    })
-    this.ffmpegResolved = usable ? candidate : null
-    return usable ? candidate : undefined
+    const resolved = await resolveFfmpegExecutable()
+    this.ffmpegResolved = resolved ?? null
+    return resolved
   }
 
   /** The primitives the feature modules are allowed to use. */
@@ -3593,6 +3581,74 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
  * @param message - the timeout error message.
  * @returns the promise's value, or a rejected promise on timeout/abort.
  */
+/** The name ffmpeg is installed under, resolved through PATH. */
+const FFMPEG_NAME = 'ffmpeg'
+
+/**
+ * Find an ffmpeg to encode with, or explain what was tried.
+ *
+ * A PATH lookup alone is not enough here: measured on this machine, `spawn('ffmpeg')` from inside
+ * the running plugin process failed while `/usr/bin/ffmpeg` was present and ran fine under the
+ * process's own environment reproduced outside it. The cause was never pinned down, so this does
+ * not depend on PATH being usable: the override, then PATH, then the conventional install
+ * locations — the same shape the system-browser detection uses.
+ * @param env - environment to read the override and PATH from (injected for tests).
+ * @returns the executable to spawn, or undefined when nothing answered.
+ */
+export async function resolveFfmpegExecutable(env: NodeJS.ProcessEnv = process.env): Promise<string | undefined> {
+  const override = env.DSH_BROWSER_FFMPEG_PATH
+  const candidates = [
+    ...override !== undefined && override !== '' ? [override] : [],
+    FFMPEG_NAME,
+    ...ffmpegFallbackPaths(),
+  ]
+  for (const candidate of candidates) {
+    if (await canRunFfmpeg(candidate, env)) return candidate
+  }
+  process.stderr.write(`[dsh-browser] no usable ffmpeg: tried ${candidates.join(', ')} (set DSH_BROWSER_FFMPEG_PATH to point at one)\n`)
+  return undefined
+}
+
+/**
+ * Absolute locations to try when the PATH lookup fails.
+ *
+ * Measured on this machine: `spawn('ffmpeg')` from inside the running plugin process failed while
+ * `/usr/bin/ffmpeg` was present and executable, with the process's own environment reproduced
+ * outside it working fine — the cause was never pinned down, so the fix does not depend on PATH
+ * being usable at all. The list mirrors how a system browser is found: PATH first, then the
+ * conventional places each platform installs to.
+ * @returns candidate executables, most likely first.
+ */
+function ffmpegFallbackPaths(): readonly string[] {
+  if (process.platform === 'win32') {
+    const programFiles = process.env.ProgramFiles ?? 'C:\\Program Files'
+    return [join(programFiles, 'ffmpeg', 'bin', 'ffmpeg.exe'), 'C:\\ffmpeg\\bin\\ffmpeg.exe']
+  }
+  return ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/bin/ffmpeg', '/opt/homebrew/bin/ffmpeg', '/snap/bin/ffmpeg']
+}
+
+/**
+ * Whether an executable answers `-version` with a zero exit inside a short budget.
+ * @param candidate - the executable to try.
+ * @param env - the environment to try it with.
+ * @returns true when it ran and exited cleanly.
+ */
+function canRunFfmpeg(candidate: string, env: NodeJS.ProcessEnv): Promise<boolean> {
+  return new Promise<boolean>(resolve => {
+    let settled = false
+    const done = (value: boolean): void => { if (!settled) { settled = true; resolve(value) } }
+    try {
+      // The injected environment is the one the child gets, so a test can control the PATH the
+      // lookup actually sees instead of controlling a value the lookup ignores.
+      const child = spawn(candidate, ['-version'], { stdio: 'ignore', env })
+      child.on('error', () => done(false))
+      child.on('exit', code => done(code === 0))
+      const timer = setTimeout(() => { try { child.kill() } catch { /* gone */ } done(false) }, 5_000)
+      timer.unref()
+    } catch { done(false) }
+  })
+}
+
 function withTimeout<T>(
   promise: Promise<T>,
   ms: number,

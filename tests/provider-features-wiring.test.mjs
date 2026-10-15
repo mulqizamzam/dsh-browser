@@ -7,7 +7,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { ElectronBrowserProvider } from '../lib/browser-electron/provider.js'
+import { ElectronBrowserProvider, resolveFfmpegExecutable } from '../lib/browser-electron/provider.js'
 
 /** A host stub with one view that answers CDP commands without a browser. */
 function makeHost() {
@@ -78,4 +78,19 @@ test('the feature methods refuse a session that does not exist', async () => {
   await assert.rejects(provider.trace(missing, { action: 'start' }), /session/i)
   await assert.rejects(provider.video(missing, { action: 'start' }), /session/i)
   await assert.rejects(provider.network(missing, { action: 'list' }), /session/i)
+})
+
+test('ffmpeg is found by absolute path when the PATH lookup cannot resolve it', async () => {
+  // A live run failed here: `spawn('ffmpeg')` inside the running plugin process reported nothing
+  // while /usr/bin/ffmpeg was present and executable, so the video tool refused to encode. The
+  // resolution no longer depends on PATH alone; this pins that with an empty PATH, which is the
+  // closest a test can get to that failure.
+  const resolved = await resolveFfmpegExecutable({ PATH: '' })
+  if (process.platform === 'win32') return // the fallback list is Windows-shaped; covered there
+  assert.equal(resolved, '/usr/bin/ffmpeg', 'the first conventional location answers')
+})
+
+test('an override wins, and nothing usable is reported as undefined', async () => {
+  assert.equal(await resolveFfmpegExecutable({ PATH: '', DSH_BROWSER_FFMPEG_PATH: '/bin/ffmpeg' }), '/bin/ffmpeg')
+  assert.equal(await resolveFfmpegExecutable({ PATH: '', DSH_BROWSER_FFMPEG_PATH: '/nonexistent/ffmpeg' }), '/usr/bin/ffmpeg', 'a bad override falls through to the conventional list')
 })
